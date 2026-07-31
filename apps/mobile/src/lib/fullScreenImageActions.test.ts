@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   directoryCreate: vi.fn(),
-  delete: vi.fn(),
+  directoryDelete: vi.fn(),
   downloadFileAsync: vi.fn(),
   write: vi.fn(),
   isAvailableAsync: vi.fn(),
@@ -18,7 +18,6 @@ class FakeFile {
       .join("/");
   }
   create = (options?: unknown) => mocks.create(this.uri, options);
-  delete = () => mocks.delete(this.uri);
   write = (content: string, options?: unknown) => mocks.write(this.uri, content, options);
   static downloadFileAsync = (url: string, destination: FakeFile, options?: unknown) =>
     mocks.downloadFileAsync(url, destination, options);
@@ -32,6 +31,7 @@ class FakeDirectory {
       .join("/");
   }
   create = (options?: unknown) => mocks.directoryCreate(this.uri, options);
+  delete = () => mocks.directoryDelete(this.uri);
 }
 
 vi.mock("expo-file-system", () => ({
@@ -48,18 +48,36 @@ vi.mock("expo-sharing", () => ({
 import {
   SHARE_FAILED_MESSAGE,
   SHARING_UNAVAILABLE_MESSAGE,
-  redactUri,
+  imageUriMetadata,
   shareImage,
 } from "./fullScreenImageActions";
 
-describe("redactUri", () => {
-  it("reduces a data URI to its media type so bytes never reach a log", () => {
-    expect(redactUri("data:image/png;base64,U0VDUkVU")).toBe("data:image/png");
-    expect(redactUri("data:image/png;charset=utf-8;base64,U0VDUkVU")).toBe("data:image/png");
+/** A signed asset URL of the shape `assets.createUrl` mints. */
+const SIGNED_ASSET_URL =
+  "https://relay.example.test/api/assets/eyJhIjoxfQ.s3cr3tS1gnatur3/light-ui.png";
+
+describe("imageUriMetadata", () => {
+  it("keeps the signed token out of asset URL diagnostics", () => {
+    const metadata = imageUriMetadata(SIGNED_ASSET_URL);
+
+    expect(metadata).toEqual({ scheme: "https", host: "relay.example.test" });
+    expect(JSON.stringify(metadata)).not.toContain("s3cr3tS1gnatur3");
   });
 
-  it("leaves ordinary URLs alone", () => {
-    expect(redactUri("https://example.test/a.png")).toBe("https://example.test/a.png");
+  it("reduces a data URI to its media type", () => {
+    expect(imageUriMetadata("data:image/png;base64,U0VDUkVU")).toEqual({
+      scheme: "data",
+      host: "image/png",
+    });
+    expect(imageUriMetadata("data:image/png;charset=utf-8;base64,U0VDUkVU")).toEqual({
+      scheme: "data",
+      host: "image/png",
+    });
+  });
+
+  it("handles local files and unparseable input", () => {
+    expect(imageUriMetadata("file:///tmp/shot.png").scheme).toBe("file");
+    expect(imageUriMetadata("not a url").scheme).toBe("unknown");
   });
 });
 
@@ -75,7 +93,7 @@ describe("shareImage", () => {
     vi.restoreAllMocks();
   });
 
-  it("shares a local file directly and never deletes it", async () => {
+  it("shares a local file directly and never deletes anything", async () => {
     const result = await shareImage({ uri: "file:///tmp/shot.png" });
 
     expect(result).toEqual({ ok: true });
@@ -84,10 +102,10 @@ describe("shareImage", () => {
       expect.objectContaining({ mimeType: "image/png", UTI: "public.png" }),
     );
     expect(mocks.downloadFileAsync).not.toHaveBeenCalled();
-    expect(mocks.delete).not.toHaveBeenCalled();
+    expect(mocks.directoryDelete).not.toHaveBeenCalled();
   });
 
-  it("writes a data URI to a temp file, shares it, then deletes it", async () => {
+  it("writes a data URI to a temp directory, shares it, then removes the directory", async () => {
     const result = await shareImage({ uri: "data:image/png;base64,QUJD" });
 
     expect(result).toEqual({ ok: true });
@@ -96,7 +114,7 @@ describe("shareImage", () => {
       "QUJD",
       expect.objectContaining({ encoding: "base64" }),
     );
-    expect(mocks.delete).toHaveBeenCalledTimes(1);
+    expect(mocks.directoryDelete).toHaveBeenCalledTimes(1);
   });
 
   it("handles data URIs carrying extra media-type parameters", async () => {
@@ -106,31 +124,39 @@ describe("shareImage", () => {
     expect(mocks.write).toHaveBeenCalledWith(expect.anything(), "QUJD", expect.anything());
   });
 
-  it("downloads a remote image, then cleans the temp file up", async () => {
+  it("downloads a remote image, then removes the temp directory", async () => {
     const result = await shareImage({ uri: "https://example.test/assets/a.png?revision=3" });
 
     expect(result).toEqual({ ok: true });
-    expect(mocks.downloadFileAsync).toHaveBeenCalledWith(
-      "https://example.test/assets/a.png?revision=3",
-      expect.anything(),
-      expect.anything(),
-    );
     // The cache-buster must not be read as part of the extension.
     expect(mocks.shareAsync).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ mimeType: "image/png" }),
     );
-    expect(mocks.delete).toHaveBeenCalledTimes(1);
+    expect(mocks.directoryDelete).toHaveBeenCalledTimes(1);
   });
 
-  it("derives the temp file name from fileName, stripping any path", async () => {
-    await shareImage({ uri: "https://example.test/a.png", fileName: "../../etc/logo.png" });
+  it("keeps the display name intact while isolating each share in its own directory", async () => {
+    await shareImage({ uri: SIGNED_ASSET_URL, fileName: "../../etc/light-ui.png" });
+    await shareImage({ uri: SIGNED_ASSET_URL, fileName: "light-ui.png" });
 
-    expect(mocks.downloadFileAsync).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ uri: expect.stringContaining("logo.png") }),
-      expect.anything(),
-    );
+    const [first, second] = mocks.downloadFileAsync.mock.calls.map((call) => call[1].uri);
+    expect(first).toContain("light-ui.png");
+    expect(second).toContain("light-ui.png");
+    expect(first).not.toBe(second);
+  });
+
+  it("removes the temp directory when writing the file fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mocks.write.mockImplementation(() => {
+      throw new Error("storage exhausted");
+    });
+
+    const result = await shareImage({ uri: "data:image/png;base64,QUJD" });
+
+    expect(result).toEqual({ ok: false, message: SHARE_FAILED_MESSAGE });
+    expect(mocks.directoryDelete).toHaveBeenCalledTimes(1);
+    expect(mocks.shareAsync).not.toHaveBeenCalled();
   });
 
   it("reports when sharing is unavailable instead of throwing", async () => {
@@ -142,19 +168,20 @@ describe("shareImage", () => {
     expect(mocks.shareAsync).not.toHaveBeenCalled();
   });
 
-  it("reports a failure without logging image bytes, and still deletes the temp file", async () => {
-    const logged: Array<unknown> = [];
+  it("logs neither the signed token nor image bytes, and records the failing stage", async () => {
+    const logged: Array<{ message: string; stage: string; host?: string }> = [];
     vi.spyOn(console, "error").mockImplementation((value: unknown) => {
-      logged.push(value);
+      logged.push(value as { message: string; stage: string; host?: string });
     });
     mocks.shareAsync.mockRejectedValue(new Error("sheet failed"));
 
-    const result = await shareImage({ uri: "data:image/png;base64,U0VDUkVU" });
+    await shareImage({ uri: SIGNED_ASSET_URL });
+    await shareImage({ uri: "data:image/png;base64,U0VDUkVU" });
 
-    expect(result).toEqual({ ok: false, message: SHARE_FAILED_MESSAGE });
-    expect(mocks.delete).toHaveBeenCalledTimes(1);
-    const serialized = logged.map((entry) => String((entry as Error).message)).join("\n");
+    const serialized = logged.map((entry) => entry.message).join("\n");
+    expect(serialized).not.toContain("s3cr3tS1gnatur3");
     expect(serialized).not.toContain("U0VDUkVU");
-    expect(serialized).toContain("data:image/png");
+    expect(logged[0]?.host).toBe("relay.example.test");
+    expect(logged[0]?.stage).toBe("share");
   });
 });

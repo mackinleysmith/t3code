@@ -17,11 +17,15 @@ export const SHARING_UNAVAILABLE_MESSAGE = "Sharing isn't available on this devi
 export const SHARE_FAILED_MESSAGE = "Couldn't share the image.";
 
 export class ImageShareError extends Schema.TaggedErrorClass<ImageShareError>()("ImageShareError", {
-  uri: Schema.String,
+  stage: Schema.Literals(["materialize", "share"]),
+  scheme: Schema.String,
+  host: Schema.optional(Schema.String),
   cause: Schema.Defect(),
 }) {
   override get message(): string {
-    return `Failed to share the image at ${this.uri}.`;
+    const action = this.stage === "materialize" ? "prepare" : "share";
+    const from = this.host === undefined ? "" : ` from ${this.host}`;
+    return `Failed to ${action} the ${this.scheme} image${from}.`;
   }
 }
 
@@ -45,12 +49,30 @@ const IMAGE_TYPES: ReadonlyArray<{
 
 type ImageType = (typeof IMAGE_TYPES)[number];
 
-let temporaryFileCounter = 0;
+let temporaryDirectoryCounter = 0;
 
-/** `data:` URIs *are* the image bytes, so they are never logged verbatim. */
-export function redactUri(uri: string): string {
-  const match = DATA_URI_PATTERN.exec(uri);
-  return match === null ? uri : `data:${match[1] || "application/octet-stream"}`;
+/**
+ * Safe diagnostics for an image URI, mirroring `openExternalUrl`. Asset URLs are
+ * signed capabilities and `data:` URIs are the image bytes, so neither may be
+ * logged whole. For a `data:` URI `host` carries the media type instead.
+ */
+export function imageUriMetadata(uri: string): {
+  readonly scheme: string;
+  readonly host?: string;
+} {
+  const dataMatch = DATA_URI_PATTERN.exec(uri);
+  if (dataMatch !== null) {
+    return { scheme: "data", host: dataMatch[1] || "application/octet-stream" };
+  }
+  try {
+    const parsed = new URL(uri);
+    return {
+      scheme: parsed.protocol.replace(/:$/, "") || "unknown",
+      host: parsed.hostname || undefined,
+    };
+  } catch {
+    return { scheme: /^([a-z][a-z\d+.-]*):/i.exec(uri)?.[1]?.toLowerCase() ?? "unknown" };
+  }
 }
 
 function imageTypeFor(uri: string): ImageType | null {
@@ -70,7 +92,7 @@ function imageTypeFor(uri: string): ImageType | null {
   return IMAGE_TYPES.find((type) => type.extension === extension) ?? null;
 }
 
-/** Returns "" when nothing usable is left, so the caller falls back to the counter. */
+/** Returns "" when nothing usable is left, so the caller falls back to a generic name. */
 function sanitizeFileNameStem(fileName: string): string {
   const withoutDirectories = fileName.split(/[\\/]/).pop() ?? "";
   const dotIndex = withoutDirectories.lastIndexOf(".");
@@ -81,72 +103,85 @@ function sanitizeFileNameStem(fileName: string): string {
 function temporaryFileName(source: FullScreenImageSource): string {
   const extension = imageTypeFor(source.uri)?.extension ?? "img";
   const stem = source.fileName ? sanitizeFileNameStem(source.fileName) : "";
-  if (stem.length > 0) {
-    return `${stem}.${extension}`;
-  }
-  temporaryFileCounter += 1;
-  return `image-${temporaryFileCounter}.${extension}`;
+  return `${stem.length > 0 ? stem : "image"}.${extension}`;
 }
 
 function isLocalFileUri(uri: string): boolean {
   return uri.startsWith("file://") || uri.startsWith("/");
 }
 
-async function cacheDirectory() {
+/**
+ * A fresh directory per share. The file inside keeps its display name, which is
+ * what the share sheet shows, while the unique parent stops two shares of
+ * same-named images from overwriting each other.
+ */
+async function createTemporaryDirectory() {
   const { Directory, Paths } = await import("expo-file-system");
-  const directory = new Directory(Paths.cache, CACHE_DIRECTORY_NAME);
+  temporaryDirectoryCounter += 1;
+  const directory = new Directory(
+    Paths.cache,
+    CACHE_DIRECTORY_NAME,
+    String(temporaryDirectoryCounter),
+  );
   directory.create({ idempotent: true, intermediates: true });
   return directory;
 }
 
-function deleteQuietly(file: { delete: () => void }): void {
+function deleteQuietly(target: { delete: () => void }): void {
   try {
-    file.delete();
+    target.delete();
   } catch {
-    // A leftover file in the cache directory is harmless; the OS reclaims it.
+    // A leftover entry in the cache directory is harmless; the OS reclaims it.
   }
 }
 
 type MaterializedImage = {
-  readonly file: { readonly uri: string; delete: () => void };
-  /** True when we created the file and are therefore responsible for removing it. */
-  readonly ownsTemporaryFile: boolean;
+  readonly file: { readonly uri: string };
+  /** Set when we created a temporary directory that must be removed afterwards. */
+  readonly temporaryDirectory: { delete: () => void } | null;
 };
 
 /** `Sharing.shareAsync` only accepts a local file, so remote and data URIs land on disk first. */
 async function materializeImageFile(source: FullScreenImageSource): Promise<MaterializedImage> {
   const { File } = await import("expo-file-system");
 
-  const dataMatch = DATA_URI_PATTERN.exec(source.uri);
-  if (dataMatch !== null) {
-    if (dataMatch[2] === undefined) {
-      throw new Error("Only base64-encoded data URIs are supported.");
-    }
-    const file = new File(await cacheDirectory(), temporaryFileName(source));
-    file.create({ overwrite: true });
-    file.write(source.uri.slice(dataMatch[0].length), { encoding: "base64" });
-    return { file, ownsTemporaryFile: true };
-  }
-
   if (isLocalFileUri(source.uri)) {
-    return { file: new File(source.uri), ownsTemporaryFile: false };
+    return { file: new File(source.uri), temporaryDirectory: null };
   }
 
-  const destination = new File(await cacheDirectory(), temporaryFileName(source));
-  const downloaded = await File.downloadFileAsync(source.uri, destination, {
-    idempotent: true,
-  });
-  return { file: downloaded, ownsTemporaryFile: true };
+  const directory = await createTemporaryDirectory();
+  try {
+    const dataMatch = DATA_URI_PATTERN.exec(source.uri);
+    if (dataMatch !== null) {
+      if (dataMatch[2] === undefined) {
+        throw new Error("Only base64-encoded data URIs are supported.");
+      }
+      const file = new File(directory, temporaryFileName(source));
+      file.create({ overwrite: true });
+      file.write(source.uri.slice(dataMatch[0].length), { encoding: "base64" });
+      return { file, temporaryDirectory: directory };
+    }
+
+    const destination = new File(directory, temporaryFileName(source));
+    const downloaded = await File.downloadFileAsync(source.uri, destination, { idempotent: true });
+    return { file: downloaded, temporaryDirectory: directory };
+  } catch (cause) {
+    // The directory is ours and the caller never sees it, so clean up here.
+    deleteQuietly(directory);
+    throw cause;
+  }
 }
 
 export async function shareImage(source: FullScreenImageSource): Promise<ImageActionResult> {
   let materialized: MaterializedImage | null = null;
+  let stage: "materialize" | "share" = "materialize";
   try {
     if (!(await Sharing.isAvailableAsync())) {
       return { ok: false, message: SHARING_UNAVAILABLE_MESSAGE };
     }
 
     materialized = await materializeImageFile(source);
+    stage = "share";
     const imageType = imageTypeFor(source.uri);
 
     // Resolves only after the sheet is dismissed, so the file outlives every read.
@@ -158,11 +193,11 @@ export async function shareImage(source: FullScreenImageSource): Promise<ImageAc
 
     return { ok: true };
   } catch (cause) {
-    console.error(new ImageShareError({ uri: redactUri(source.uri), cause }));
+    console.error(new ImageShareError({ stage, ...imageUriMetadata(source.uri), cause }));
     return { ok: false, message: SHARE_FAILED_MESSAGE };
   } finally {
-    if (materialized?.ownsTemporaryFile) {
-      deleteQuietly(materialized.file);
+    if (materialized?.temporaryDirectory) {
+      deleteQuietly(materialized.temporaryDirectory);
     }
   }
 }
