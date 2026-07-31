@@ -107,7 +107,9 @@ function temporaryFileName(source: FullScreenImageSource): string {
 }
 
 function isLocalFileUri(uri: string): boolean {
-  return uri.startsWith("file://") || uri.startsWith("/");
+  // Android hands back content:// for picked and shared media. It is already on
+  // the device, so it must not fall through to the download branch.
+  return uri.startsWith("file://") || uri.startsWith("content://") || uri.startsWith("/");
 }
 
 /**

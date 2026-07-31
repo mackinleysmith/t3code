@@ -60,6 +60,29 @@ describe("shareImageExclusively", () => {
     expect(mocks.shareImage).toHaveBeenCalledTimes(2);
   });
 
+  it("expires the lock so a sheet that never settles cannot disable sharing", async () => {
+    vi.useFakeTimers();
+    try {
+      // A share that hangs forever, as some Android targets do after a cancel.
+      mocks.shareImage.mockReturnValueOnce(new Promise(() => {}));
+      void shareImageExclusively({ uri: "https://example.test/a.png" });
+      expect(mocks.shareImage).toHaveBeenCalledTimes(1);
+
+      // Still held while the lock is fresh.
+      vi.setSystemTime(Date.now() + 59_000);
+      void shareImageExclusively({ uri: "https://example.test/b.png" });
+      expect(mocks.shareImage).toHaveBeenCalledTimes(1);
+
+      // Released once it goes stale.
+      vi.setSystemTime(Date.now() + 2_000);
+      mocks.shareImage.mockResolvedValue({ ok: true });
+      await shareImageExclusively({ uri: "https://example.test/c.png" });
+      expect(mocks.shareImage).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("releases the guard when shareImage throws", async () => {
     mocks.shareImage.mockRejectedValue(new Error("boom"));
 

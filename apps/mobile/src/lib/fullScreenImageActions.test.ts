@@ -105,6 +105,18 @@ describe("shareImage", () => {
     expect(mocks.directoryDelete).not.toHaveBeenCalled();
   });
 
+  it("treats an Android content:// URI as local rather than downloading it", async () => {
+    const result = await shareImage({ uri: "content://media/external/images/media/42" });
+
+    expect(result).toEqual({ ok: true });
+    expect(mocks.downloadFileAsync).not.toHaveBeenCalled();
+    expect(mocks.shareAsync).toHaveBeenCalledWith(
+      "content://media/external/images/media/42",
+      expect.anything(),
+    );
+    expect(mocks.directoryDelete).not.toHaveBeenCalled();
+  });
+
   it("writes a data URI to a temp directory, shares it, then removes the directory", async () => {
     const result = await shareImage({ uri: "data:image/png;base64,QUJD" });
 
