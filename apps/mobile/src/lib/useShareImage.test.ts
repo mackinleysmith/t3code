@@ -83,6 +83,45 @@ describe("shareImageExclusively", () => {
     }
   });
 
+  it("does not let a stale share release the lock a newer share holds", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseStale: (() => void) | undefined;
+      mocks.shareImage.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseStale = () => resolve({ ok: true });
+        }),
+      );
+      // A hangs and its lock goes stale.
+      void shareImageExclusively({ uri: "https://example.test/a.png" });
+      vi.setSystemTime(Date.now() + 61_000);
+
+      // B takes the lock.
+      let releaseCurrent: (() => void) | undefined;
+      mocks.shareImage.mockReturnValueOnce(
+        new Promise((resolve) => {
+          releaseCurrent = () => resolve({ ok: true });
+        }),
+      );
+      const current = shareImageExclusively({ uri: "https://example.test/b.png" });
+      expect(mocks.shareImage).toHaveBeenCalledTimes(2);
+
+      // A finally settles. It must not clear B's lock.
+      releaseStale?.();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      void shareImageExclusively({ uri: "https://example.test/c.png" });
+      expect(mocks.shareImage).toHaveBeenCalledTimes(2);
+
+      // Leave the module-level lock free for the next test.
+      releaseCurrent?.();
+      await current;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("releases the guard when shareImage throws", async () => {
     mocks.shareImage.mockRejectedValue(new Error("boom"));
 

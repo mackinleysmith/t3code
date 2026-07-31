@@ -11,22 +11,27 @@ import { shareImage, type FullScreenImageSource } from "./fullScreenImageActions
 // share sheet that never settles would otherwise disable sharing app-wide until
 // the app restarts, which is a worse failure than the stacking it prevents.
 const SHARE_LOCK_TIMEOUT_MS = 60_000;
-let shareStartedAt: number | null = null;
+let activeShare: { readonly startedAt: number } | null = null;
 
 /** Exported for tests. The hook is a thin wrapper around this. */
 export async function shareImageExclusively(source: FullScreenImageSource): Promise<void> {
   const startedAt = Date.now();
-  if (shareStartedAt !== null && startedAt - shareStartedAt < SHARE_LOCK_TIMEOUT_MS) {
+  if (activeShare !== null && startedAt - activeShare.startedAt < SHARE_LOCK_TIMEOUT_MS) {
     return;
   }
-  shareStartedAt = startedAt;
+  // Identity, not the timestamp: a share that settles after its lock expired
+  // must not release the lock a newer share has since taken.
+  const share = { startedAt };
+  activeShare = share;
   try {
     const result = await shareImage(source);
     if (!result.ok) {
       Alert.alert(result.message);
     }
   } finally {
-    shareStartedAt = null;
+    if (activeShare === share) {
+      activeShare = null;
+    }
   }
 }
 
