@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
+  copy: vi.fn(),
   directoryCreate: vi.fn(),
   directoryDelete: vi.fn(),
   downloadFileAsync: vi.fn(),
@@ -18,6 +19,7 @@ class FakeFile {
       .join("/");
   }
   create = (options?: unknown) => mocks.create(this.uri, options);
+  copy = (destination: FakeFile) => mocks.copy(this.uri, destination.uri);
   write = (content: string, options?: unknown) => mocks.write(this.uri, content, options);
   static downloadFileAsync = (url: string, destination: FakeFile, options?: unknown) =>
     mocks.downloadFileAsync(url, destination, options);
@@ -105,16 +107,17 @@ describe("shareImage", () => {
     expect(mocks.directoryDelete).not.toHaveBeenCalled();
   });
 
-  it("treats an Android content:// URI as local rather than downloading it", async () => {
+  it("copies an Android content:// URI into a real file before sharing", async () => {
     const result = await shareImage({ uri: "content://media/external/images/media/42" });
 
     expect(result).toEqual({ ok: true });
     expect(mocks.downloadFileAsync).not.toHaveBeenCalled();
-    expect(mocks.shareAsync).toHaveBeenCalledWith(
-      "content://media/external/images/media/42",
-      expect.anything(),
-    );
-    expect(mocks.directoryDelete).not.toHaveBeenCalled();
+    // Android's shareAsync throws on any scheme other than file, so the sheet
+    // must never be handed the content URI itself.
+    expect(mocks.copy).toHaveBeenCalledTimes(1);
+    const sharedUri = mocks.shareAsync.mock.calls[0]?.[0] as string;
+    expect(sharedUri).not.toContain("content://");
+    expect(mocks.directoryDelete).toHaveBeenCalledTimes(1);
   });
 
   it("writes a data URI to a temp directory, shares it, then removes the directory", async () => {

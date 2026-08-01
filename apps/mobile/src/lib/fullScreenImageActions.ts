@@ -106,10 +106,17 @@ function temporaryFileName(source: FullScreenImageSource): string {
   return `${stem.length > 0 ? stem : "image"}.${extension}`;
 }
 
-function isLocalFileUri(uri: string): boolean {
-  // Android hands back content:// for picked and shared media. It is already on
-  // the device, so it must not fall through to the download branch.
-  return uri.startsWith("file://") || uri.startsWith("content://") || uri.startsWith("/");
+/**
+ * Only a real file can be handed straight to the sheet. Android's `shareAsync`
+ * rejects every other scheme outright, so `content://` is copied first even
+ * though the bytes are already on the device.
+ */
+function isShareableFileUri(uri: string): boolean {
+  return uri.startsWith("file://") || uri.startsWith("/");
+}
+
+function isContentUri(uri: string): boolean {
+  return uri.startsWith("content://");
 }
 
 /**
@@ -147,7 +154,7 @@ type MaterializedImage = {
 async function materializeImageFile(source: FullScreenImageSource): Promise<MaterializedImage> {
   const { File } = await import("expo-file-system");
 
-  if (isLocalFileUri(source.uri)) {
+  if (isShareableFileUri(source.uri)) {
     return { file: new File(source.uri), temporaryDirectory: null };
   }
 
@@ -162,6 +169,12 @@ async function materializeImageFile(source: FullScreenImageSource): Promise<Mate
       file.create({ overwrite: true });
       file.write(source.uri.slice(dataMatch[0].length), { encoding: "base64" });
       return { file, temporaryDirectory: directory };
+    }
+
+    if (isContentUri(source.uri)) {
+      const destination = new File(directory, temporaryFileName(source));
+      await new File(source.uri).copy(destination);
+      return { file: destination, temporaryDirectory: directory };
     }
 
     const destination = new File(directory, temporaryFileName(source));
