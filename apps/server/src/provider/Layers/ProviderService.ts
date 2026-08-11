@@ -27,6 +27,7 @@ import {
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -47,7 +48,11 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
-import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
+import {
+  type ProviderAdapterError,
+  ProviderSessionWorkspaceMissingError,
+  ProviderValidationError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -215,6 +220,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+  const fileSystem = yield* FileSystem.FileSystem;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
@@ -399,6 +405,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
+
+      // Resuming into a directory that no longer exists does not fail cleanly:
+      // provider CLIs key their transcript store off the cwd, so a removed
+      // worktree surfaces as a generic "session not found" and the thread looks
+      // unrecoverable even though the conversation is intact. Detect it here so
+      // callers get an error they can actually repair.
+      if (persistedCwd !== undefined) {
+        // Only block the resume when the directory is positively known to be
+        // gone; a failed stat must not strand an otherwise healthy thread.
+        const workspaceExists = yield* fileSystem
+          .exists(persistedCwd)
+          .pipe(Effect.orElseSucceed(() => true));
+        if (!workspaceExists) {
+          yield* Effect.logWarning("provider.session.workspace-missing", {
+            threadId: input.binding.threadId,
+            provider: input.binding.provider,
+            cwd: persistedCwd,
+          });
+          return yield* new ProviderSessionWorkspaceMissingError({
+            threadId: input.binding.threadId,
+            cwd: persistedCwd,
+          });
+        }
+      }
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
       const resumed = yield* adapter
