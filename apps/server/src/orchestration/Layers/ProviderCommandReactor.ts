@@ -442,7 +442,13 @@ const make = Effect.gen(function* () {
     }
 
     const branch = input.thread.branch;
-    const project = yield* resolveProject(input.thread.projectId);
+    // Every other call here is guarded, and this one must be too: turn start
+    // caches its dedupe key before any work, so a failure escaping this
+    // best-effort repair would drop the turn silently for the 30 minute TTL
+    // rather than surfacing anything to the user.
+    const project = yield* resolveProject(input.thread.projectId).pipe(
+      Effect.orElseSucceed(() => undefined),
+    );
     const workspaceRoot = project?.workspaceRoot;
 
     if (!branch || !workspaceRoot) {

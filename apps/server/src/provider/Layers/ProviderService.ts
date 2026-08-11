@@ -379,12 +379,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     if (input.cwd === undefined) {
       return;
     }
-    // Only block the resume when the directory is positively known to be gone;
-    // a failed stat must not strand an otherwise healthy thread.
-    const workspaceExists = yield* fileSystem
-      .exists(input.cwd)
-      .pipe(Effect.orElseSucceed(() => true));
-    if (workspaceExists) {
+    // `exists` is true for any entry, including a plain file left at the path.
+    // Launching a provider process with a file as its cwd fails at the process
+    // level with something even less legible than the error this replaces, so
+    // require an actual directory.
+    //
+    // Only block the resume when the path is positively known to be unusable:
+    // a missing path is the case we are here for, but any other stat failure
+    // (permissions, a transient FS error) must not strand a healthy thread.
+    const usable = yield* fileSystem.stat(input.cwd).pipe(
+      Effect.map((info) => info.type === "Directory"),
+      Effect.catch((error) =>
+        Effect.succeed(error.reason._tag !== "NotFound" && error.reason._tag !== "BadArgument"),
+      ),
+    );
+    if (usable) {
       return;
     }
     yield* Effect.logWarning("provider.session.workspace-missing", {
@@ -646,8 +655,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         });
         // Only when resuming: a fresh session with a missing cwd is a
         // different problem, and failing here would break thread creation if
-        // the workspace is still being provisioned.
-        if (effectiveResumeCursor !== undefined) {
+        // the workspace is still being provisioned. A persisted cursor is null
+        // rather than undefined when there is no resume state, so both count
+        // as "not resuming".
+        if (effectiveResumeCursor !== undefined && effectiveResumeCursor !== null) {
           yield* assertResumeWorkspaceExists({
             threadId,
             cwd: effectiveCwd,

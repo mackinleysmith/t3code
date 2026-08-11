@@ -1241,6 +1241,43 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  it.effect("refuses to resume when a file has replaced the workspace directory", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const replacedCwd = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-provider-replaced-worktree-"),
+      );
+
+      const initial = yield* provider.startSession(asThreadId("thread-replaced-worktree"), {
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: claudeAgentInstanceId,
+        threadId: asThreadId("thread-replaced-worktree"),
+        cwd: replacedCwd,
+        runtimeMode: "full-access",
+      });
+
+      yield* routing.claude.stopAll();
+      routing.claude.startSession.mockClear();
+
+      // A plain file at the path: exists() would call this fine, but no
+      // process can chdir into it.
+      NodeFS.rmSync(replacedCwd, { recursive: true, force: true });
+      NodeFS.writeFileSync(replacedCwd, "not a directory");
+
+      const failure = yield* Effect.result(
+        provider.sendTurn({ threadId: initial.threadId, input: "resume", attachments: [] }),
+      );
+
+      assert.equal(failure._tag, "Failure");
+      if (failure._tag !== "Failure") {
+        return;
+      }
+      assert.equal(failure.failure._tag, "ProviderSessionWorkspaceMissingError");
+      assert.equal(routing.claude.startSession.mock.calls.length, 0);
+      NodeFS.rmSync(replacedCwd, { force: true });
+    }),
+  );
+
   // Turn start reaches startSession through the reactor's ensure-session step,
   // not through sendTurn's recovery path, so the guard has to cover both.
   it.effect("refuses to start a resuming session whose cwd no longer exists", () =>
