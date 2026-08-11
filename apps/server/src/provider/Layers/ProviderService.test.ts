@@ -1241,6 +1241,52 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
+  // Turn start reaches startSession through the reactor's ensure-session step,
+  // not through sendTurn's recovery path, so the guard has to cover both.
+  it.effect("refuses to start a resuming session whose cwd no longer exists", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const removedCwd = NodeFS.mkdtempSync(
+        NodePath.join(NodeOS.tmpdir(), "t3-provider-start-removed-worktree-"),
+      );
+
+      const initial = yield* provider.startSession(asThreadId("thread-start-removed-worktree"), {
+        provider: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId: claudeAgentInstanceId,
+        threadId: asThreadId("thread-start-removed-worktree"),
+        cwd: removedCwd,
+        runtimeMode: "full-access",
+      });
+
+      yield* routing.claude.stopAll();
+      routing.claude.startSession.mockClear();
+
+      NodeFS.rmSync(removedCwd, { recursive: true, force: true });
+
+      // Mirrors the reactor: restart with the persisted resume cursor.
+      const failure = yield* Effect.result(
+        provider.startSession(initial.threadId, {
+          provider: ProviderDriverKind.make("claudeAgent"),
+          providerInstanceId: claudeAgentInstanceId,
+          threadId: initial.threadId,
+          cwd: removedCwd,
+          runtimeMode: "full-access",
+        }),
+      );
+
+      assert.equal(failure._tag, "Failure");
+      if (failure._tag !== "Failure") {
+        return;
+      }
+      assert.equal(failure.failure._tag, "ProviderSessionWorkspaceMissingError");
+      if (failure.failure._tag !== "ProviderSessionWorkspaceMissingError") {
+        return;
+      }
+      assert.equal(failure.failure.cwd, removedCwd);
+      assert.equal(routing.claude.startSession.mock.calls.length, 0);
+    }),
+  );
+
   it.effect("refuses to resume a stale session whose persisted cwd no longer exists", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;

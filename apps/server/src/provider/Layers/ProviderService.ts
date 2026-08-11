@@ -361,6 +361,43 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     () => reconcileInstanceSubscriptions,
   ).pipe(Effect.forkScoped);
 
+  /**
+   * Resuming into a directory that no longer exists does not fail cleanly:
+   * provider CLIs key their transcript store off the cwd, so a removed worktree
+   * surfaces as a generic "session not found" and the thread looks
+   * unrecoverable even though the conversation is intact on both sides.
+   *
+   * Guards every path that hands a resume cursor to an adapter — both
+   * `startSession` (which turn start reaches via the reactor's ensure-session
+   * step) and `recoverSessionForThread`.
+   */
+  const assertResumeWorkspaceExists = Effect.fnUntraced(function* (input: {
+    readonly threadId: ThreadId;
+    readonly cwd: string | undefined;
+    readonly provider?: string;
+  }) {
+    if (input.cwd === undefined) {
+      return;
+    }
+    // Only block the resume when the directory is positively known to be gone;
+    // a failed stat must not strand an otherwise healthy thread.
+    const workspaceExists = yield* fileSystem
+      .exists(input.cwd)
+      .pipe(Effect.orElseSucceed(() => true));
+    if (workspaceExists) {
+      return;
+    }
+    yield* Effect.logWarning("provider.session.workspace-missing", {
+      threadId: input.threadId,
+      ...(input.provider !== undefined ? { provider: input.provider } : {}),
+      cwd: input.cwd,
+    });
+    return yield* new ProviderSessionWorkspaceMissingError({
+      threadId: input.threadId,
+      cwd: input.cwd,
+    });
+  });
+
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
     readonly binding: ProviderSessionDirectory.ProviderRuntimeBinding;
     readonly operation: string;
@@ -406,29 +443,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      // Resuming into a directory that no longer exists does not fail cleanly:
-      // provider CLIs key their transcript store off the cwd, so a removed
-      // worktree surfaces as a generic "session not found" and the thread looks
-      // unrecoverable even though the conversation is intact. Detect it here so
-      // callers get an error they can actually repair.
-      if (persistedCwd !== undefined) {
-        // Only block the resume when the directory is positively known to be
-        // gone; a failed stat must not strand an otherwise healthy thread.
-        const workspaceExists = yield* fileSystem
-          .exists(persistedCwd)
-          .pipe(Effect.orElseSucceed(() => true));
-        if (!workspaceExists) {
-          yield* Effect.logWarning("provider.session.workspace-missing", {
-            threadId: input.binding.threadId,
-            provider: input.binding.provider,
-            cwd: persistedCwd,
-          });
-          return yield* new ProviderSessionWorkspaceMissingError({
-            threadId: input.binding.threadId,
-            cwd: persistedCwd,
-          });
-        }
-      }
+      yield* assertResumeWorkspaceExists({
+        threadId: input.binding.threadId,
+        cwd: persistedCwd,
+        provider: input.binding.provider,
+      });
 
       yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
       const resumed = yield* adapter
@@ -625,6 +644,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 : "none",
           "provider.cwd.effective": effectiveCwd ?? "",
         });
+        // Only when resuming: a fresh session with a missing cwd is a
+        // different problem, and failing here would break thread creation if
+        // the workspace is still being provisioned.
+        if (effectiveResumeCursor !== undefined) {
+          yield* assertResumeWorkspaceExists({
+            threadId,
+            cwd: effectiveCwd,
+            provider: resolvedProvider,
+          });
+        }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
         const session = yield* adapter
