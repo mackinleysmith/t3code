@@ -1530,6 +1530,53 @@ describe("ProviderCommandReactor", () => {
     await waitFor(() => harness.sendTurn.mock.calls.length === 1);
   });
 
+  // Must match the resume guard in ProviderService, which rejects a
+  // non-directory: if repair is skipped here the turn fails with nothing
+  // attempted and nothing explaining why.
+  it("attempts restore when a file occupies the worktree path", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const worktreePath = NodePath.join(
+      NodeOS.tmpdir(),
+      "t3code-reactor-worktrees",
+      "file-in-the-way",
+    );
+    NodeFS.rmSync(worktreePath, { recursive: true, force: true });
+    NodeFS.mkdirSync(NodePath.dirname(worktreePath), { recursive: true });
+    NodeFS.writeFileSync(worktreePath, "not a directory");
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-file-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        branch: "t3code/file-in-the-way",
+        worktreePath,
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-file-worktree"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-file-worktree"),
+          role: "user",
+          text: "Keep going.",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.createWorktree.mock.calls.length === 1);
+    expect(harness.createWorktree.mock.calls[0]?.[0]).toMatchObject({ path: worktreePath });
+    NodeFS.rmSync(worktreePath, { recursive: true, force: true });
+  });
+
   it("generates a worktree branch name for the first turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";

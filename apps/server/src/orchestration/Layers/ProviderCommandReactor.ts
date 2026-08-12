@@ -438,8 +438,18 @@ const make = Effect.gen(function* () {
     if (!worktreePath) {
       return;
     }
-    const exists = yield* fileSystem.exists(worktreePath).pipe(Effect.orElseSucceed(() => true));
-    if (exists) {
+    // Must agree with the resume guard in ProviderService: if that treats the
+    // path as unusable, this has to attempt the repair, or the turn fails with
+    // no repair tried and nothing explaining why. `exists` is true for a plain
+    // file left at the path, which no process can chdir into. On any other stat
+    // failure assume the workspace is fine rather than recreating over it.
+    const usable = yield* fileSystem.stat(worktreePath).pipe(
+      Effect.map((info) => info.type === "Directory"),
+      Effect.catch((error) =>
+        Effect.succeed(error.reason._tag !== "NotFound" && error.reason._tag !== "BadArgument"),
+      ),
+    );
+    if (usable) {
       return;
     }
 
