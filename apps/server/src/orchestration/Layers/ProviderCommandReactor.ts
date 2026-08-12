@@ -421,7 +421,9 @@ const make = Effect.gen(function* () {
    * thread's branch restores the binding and the working files.
    *
    * Best-effort by design: on failure we let the turn proceed so the caller's
-   * existing failure handling reports the real reason.
+   * existing failure handling reports the real reason. Interrupts are the
+   * exception and are re-raised, so a shutdown or worker drain mid-restore
+   * cannot be absorbed into a warning and carried on into session start.
    */
   const ensureThreadWorkspace = Effect.fnUntraced(function* (input: {
     readonly thread: {
@@ -473,11 +475,13 @@ const make = Effect.gen(function* () {
     // Pruning only drops entries whose directory is already gone.
     yield* gitWorkflow.pruneWorktrees({ cwd: workspaceRoot }).pipe(
       Effect.catchCause((cause) =>
-        Effect.logWarning("provider.workspace.restore.prune-failed", {
-          threadId: input.thread.threadId,
-          workspaceRoot,
-          cause: Cause.pretty(cause),
-        }),
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("provider.workspace.restore.prune-failed", {
+              threadId: input.thread.threadId,
+              workspaceRoot,
+              cause: Cause.pretty(cause),
+            }),
       ),
     );
 
@@ -486,12 +490,14 @@ const make = Effect.gen(function* () {
       .pipe(
         Effect.as(true),
         Effect.catchCause((cause) =>
-          Effect.logWarning("provider.workspace.restore.failed", {
-            threadId: input.thread.threadId,
-            worktreePath,
-            branch,
-            cause: Cause.pretty(cause),
-          }).pipe(Effect.as(false)),
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning("provider.workspace.restore.failed", {
+                threadId: input.thread.threadId,
+                worktreePath,
+                branch,
+                cause: Cause.pretty(cause),
+              }).pipe(Effect.as(false)),
         ),
       );
 
@@ -505,10 +511,12 @@ const make = Effect.gen(function* () {
       createdAt: input.createdAt,
     }).pipe(
       Effect.catchCause((cause) =>
-        Effect.logWarning("provider.workspace.restore.activity-failed", {
-          threadId: input.thread.threadId,
-          cause: Cause.pretty(cause),
-        }),
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : Effect.logWarning("provider.workspace.restore.activity-failed", {
+              threadId: input.thread.threadId,
+              cause: Cause.pretty(cause),
+            }),
       ),
     );
   });
