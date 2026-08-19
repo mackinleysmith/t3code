@@ -32,7 +32,7 @@ public struct NewThreadView: View {
     @State private var draftSaveTask: Task<Void, Never>?
     @State private var immediateDraftSaveTasks: [String: Task<Void, Never>] = [:]
     @State private var submittedSuccessfully = false
-    // Plain state, not `FocusState` — see the note on `composerFocused` in
+    // Plain state, not `FocusState`; see the note on `composerFocused` in
     // ThreadDetailView.
     @State private var promptFocused = false
 

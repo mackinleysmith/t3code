@@ -202,7 +202,7 @@ final class FeatureComposerUITextView: UITextView {
     // A SwiftUI drag gesture on the composer never sees drags that start
     // inside this view: the text interaction's own recognizers claim them at
     // the UIKit level. This observing pan reproduces the host's
-    // drag-to-dismiss there — it recognizes alongside everything, cancels
+    // drag-to-dismiss there: it recognizes alongside everything, cancels
     // nothing, and only acts below the scroll cap; a scrollable draft hands
     // dismissal to `keyboardDismissMode = .interactive` instead.
     private let dismissPanDelegate = FeatureComposerDismissPanDelegate()
@@ -244,7 +244,7 @@ final class FeatureComposerUITextView: UITextView {
     // once the cap is hit. Below the cap the pan recognizer must be off
     // entirely: an idle scroll view still swallows vertical drags, which
     // starves the host's drag-to-dismiss-keyboard gesture. A stale offset
-    // from a mid-resize selection change is reset for the same reason — with
+    // from a mid-resize selection change is reset for the same reason; with
     // nothing to scroll, any offset clips the first line under the padding.
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -301,7 +301,7 @@ private final class FeatureComposerDismissPanDelegate: NSObject, UIGestureRecogn
 
 /// Mirrors the thread view's composer drag-to-dismiss thresholds: a clearly
 /// vertical downward drag. While the draft is scrollable, scrolling back
-/// through it never drops the keyboard mid-read — but a drag that *begins*
+/// through it never drops the keyboard mid-read, but a drag that *begins*
 /// with the draft at its top only rubber-bands, which is unambiguous
 /// dismissal intent (and the composer's only escape hatch once it and the
 /// keyboard cover the transcript). `isAtTop` is the position at drag start,
