@@ -105,7 +105,10 @@ public struct ThreadDetailView: View {
             .presentationDragIndicator(.visible)
         }
         .alert("Message not sent", isPresented: $sendFailed) {
-            Button("OK") {}
+            // Refocusing happens here rather than when the send fails: the
+            // alert takes first responder from the composer, so a refocus
+            // issued before it presents is lost by the time it dismisses.
+            Button("OK") { composerFocused = true }
         } message: {
             Text("Your draft is still here. Check your connection and try again.")
         }
@@ -453,7 +456,6 @@ public struct ThreadDetailView: View {
                     !pendingIDs.contains($0.id)
                 }
                 sendFailed = true
-                composerFocused = true
             }
             isSending = false
             if !sent {

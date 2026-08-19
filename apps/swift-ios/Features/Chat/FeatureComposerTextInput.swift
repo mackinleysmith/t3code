@@ -90,8 +90,11 @@ struct FeatureComposerTextInput: UIViewRepresentable {
             context.coordinator.lastAppliedFocus = focused
             if focused, !textView.isFirstResponder {
                 textView.becomeFirstResponderWhenAttached()
-            } else if !focused, textView.isFirstResponder {
-                textView.resignFirstResponder()
+            } else if !focused {
+                textView.cancelPendingFirstResponder()
+                if textView.isFirstResponder {
+                    textView.resignFirstResponder()
+                }
             }
         }
     }
@@ -173,13 +176,19 @@ final class FeatureComposerUITextView: UITextView {
     private var wantsFirstResponderOnAttach = false
 
     /// Programmatic focus can arrive before the view joins a window (a host
-    /// refocusing right as the composer expands); retry once attached.
+    /// refocusing right as the composer expands); retry once attached. The
+    /// pending request is cancelled if focus clears again before the view
+    /// attaches, so a stale request can never raise the keyboard.
     func becomeFirstResponderWhenAttached() {
         if window != nil {
             becomeFirstResponder()
         } else {
             wantsFirstResponderOnAttach = true
         }
+    }
+
+    func cancelPendingFirstResponder() {
+        wantsFirstResponderOnAttach = false
     }
 
     override func didMoveToWindow() {

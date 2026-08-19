@@ -173,7 +173,9 @@ public struct NewThreadView: View {
             }
         }
         .alert("Couldn’t start task", isPresented: $submissionFailed) {
-            Button("OK") {}
+            // Refocus on dismissal, not on failure: the alert takes first
+            // responder, so an earlier refocus never survives it.
+            Button("OK") { promptFocused = true }
         } message: {
             Text("Check your connection and try again.")
         }
@@ -575,7 +577,6 @@ public struct NewThreadView: View {
             } else {
                 isSubmitting = false
                 submissionFailed = true
-                promptFocused = true
             }
         }
     }
