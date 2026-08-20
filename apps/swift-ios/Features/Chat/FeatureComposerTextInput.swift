@@ -43,10 +43,11 @@ struct FeatureComposerTextInput: UIViewRepresentable {
         textView.textContainerInset = .zero
         textView.textContainer.lineFragmentPadding = 0
         textView.isScrollEnabled = true
-        // Once the draft overflows its cap the drag-to-dismiss gesture loses
-        // to the scroll view, so the scroll view itself takes over keyboard
-        // dismissal the native way.
-        textView.keyboardDismissMode = .interactive
+        // Deliberately not `keyboardDismissMode = .interactive`: the capped
+        // input sits directly above the keyboard, so scrolling up through a
+        // long draft drags into the keyboard's frame and yanks it around.
+        // Dismissal belongs to the pan recognizer below, which only fires
+        // for a drag that begins with the draft at its top.
         textView.accessibilityIdentifier = "message-composer"
         updateAccessibility(textView)
         return textView
