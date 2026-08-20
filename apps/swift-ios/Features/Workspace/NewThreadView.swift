@@ -85,7 +85,8 @@ public struct NewThreadView: View {
                         onSend: startTask,
                         onStop: {},
                         forceExpanded: true,
-                        powerFeatures: composerPowerFeatures
+                        powerFeatures: composerPowerFeatures,
+                        onDismissKeyboard: { promptFocused = false }
                     )
                 }
                 .background(T3Colors.background)
