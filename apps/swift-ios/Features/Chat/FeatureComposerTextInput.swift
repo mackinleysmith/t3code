@@ -235,25 +235,25 @@ final class FeatureComposerUITextView: UITextView {
         guard FeatureComposerDragDismissPolicy.shouldDismiss(
             translationX: translation.x,
             translationY: translation.y,
-            isScrollable: isScrollEnabled,
+            isScrollable: contentOverflows,
             isAtTop: dismissPanBeganAtTop
         ) else { return }
         onDismissKeyboard?()
     }
 
-    // The view is sized to its content up to a cap, so scrolling only exists
-    // once the cap is hit. Below the cap the pan recognizer must be off
-    // entirely: an idle scroll view still swallows vertical drags, which
-    // starves the host's drag-to-dismiss-keyboard gesture. A stale offset
-    // from a mid-resize selection change is reset for the same reason; with
-    // nothing to scroll, any offset clips the first line under the padding.
+    // Scrolling stays enabled at every size: toggling `isScrollEnabled` off
+    // stops UITextView from maintaining `contentSize` on some OS versions,
+    // which left long drafts unscrollable on device. Overflow is computed
+    // fresh wherever it matters instead. A stale offset from a mid-resize
+    // selection change is still reset; with nothing to scroll, any offset
+    // clips the first line under the padding.
+    var contentOverflows: Bool {
+        contentSize.height > bounds.height + 0.5
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
-        let needsScroll = contentSize.height > bounds.height + 0.5
-        if isScrollEnabled != needsScroll {
-            isScrollEnabled = needsScroll
-        }
-        if !needsScroll, contentOffset.y != 0 {
+        if !contentOverflows, contentOffset.y != 0 {
             contentOffset.y = 0
         }
     }
