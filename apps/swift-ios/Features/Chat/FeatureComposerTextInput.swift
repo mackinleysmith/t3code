@@ -25,7 +25,6 @@ struct FeatureComposerTextInput: UIViewRepresentable {
 
     func makeUIView(context: Context) -> FeatureComposerUITextView {
         let textView = FeatureComposerUITextView()
-        context.coordinator.lastAppliedSelectionRequestID = selectionRequest?.id
         textView.delegate = context.coordinator
         textView.acceptsImages = acceptsImages
         textView.onPasteImages = onPasteImages
@@ -204,8 +203,8 @@ final class FeatureComposerUITextView: UITextView {
     // inside this view: the text interaction's own recognizers claim them at
     // the UIKit level. This observing pan reproduces the host's
     // drag-to-dismiss there: it recognizes alongside everything, cancels
-    // nothing, and only acts below the scroll cap; a scrollable draft hands
-    // dismissal to `keyboardDismissMode = .interactive` instead.
+    // nothing, and dismisses a scrollable draft only when the drag begins at
+    // its top.
     private let dismissPanDelegate = FeatureComposerDismissPanDelegate()
 
     func installDismissPanRecognizer() {
@@ -325,7 +324,9 @@ enum FeatureComposerPasteboardPolicy {
     /// (HEIC screenshots among them), so detection goes through UTType
     /// conformance instead.
     static func containsImage(in pasteboard: UIPasteboard) -> Bool {
-        pasteboard.contains(pasteboardTypes: [UTType.image.identifier])
+        pasteboard.itemProviders.contains {
+            $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+        }
     }
 }
 

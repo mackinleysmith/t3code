@@ -135,6 +135,18 @@ struct FeatureComposerPowerTests {
     }
 
     @Test
+    func nativePasteDetectionChecksEveryPasteboardItem() {
+        let pasteboard = UIPasteboard.withUniqueName()
+        defer { UIPasteboard.remove(withName: pasteboard.name) }
+        pasteboard.items = [
+            [UTType.plainText.identifier: "caption"],
+            [UTType.png.identifier: Data([0x89, 0x50, 0x4E, 0x47])],
+        ]
+
+        #expect(FeatureComposerPasteboardPolicy.containsImage(in: pasteboard))
+    }
+
+    @Test
     func detectsCommandsModelsSkillsAndPathsAtTheCursor() {
         #expect(
             FeatureComposerTriggerParser.detect(in: "/re")
