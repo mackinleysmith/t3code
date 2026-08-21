@@ -1524,7 +1524,7 @@ describe("ProviderCommandReactor", () => {
     const now = "2026-01-01T00:00:00.000Z";
     const worktreePath = NodePath.join(harness.stateDir, "missing-worktree");
 
-    await Effect.runPromise(
+    await harness.runEffect(
       harness.engine.dispatch({
         type: "thread.meta.update",
         commandId: CommandId.make("cmd-thread-missing-worktree"),
@@ -1534,7 +1534,7 @@ describe("ProviderCommandReactor", () => {
       }),
     );
 
-    await Effect.runPromise(
+    await harness.runEffect(
       harness.engine.dispatch({
         type: "thread.turn.start",
         commandId: CommandId.make("cmd-turn-start-missing-worktree"),
