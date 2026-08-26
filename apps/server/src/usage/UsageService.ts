@@ -16,7 +16,6 @@ import * as NodeOS from "node:os";
 import {
   USAGE_CONTRACT_VERSION,
   type UsageProviderKind,
-  type UsageProviderLimits,
   type UsageSource,
   type UsageSummary,
   type UsageSummaryInput,
@@ -59,8 +58,13 @@ import {
 } from "./usageScanCache.ts";
 import type { UsageRecord } from "./usageTranscripts.ts";
 import {
+  makeSubscriptionLimitsCacheEntry,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
+  readSubscriptionLimitsCacheEntry,
+  runSubscriptionLimitsProbe,
+  type SubscriptionLimitsCacheEntry,
+  type SubscriptionLimitsProbeOutcome,
 } from "./usageSubscriptionLimits.ts";
 
 const LITELLM_RATES_URL =
@@ -68,7 +72,6 @@ const LITELLM_RATES_URL =
 
 /** Rates move rarely; a day-old table keeps the page working offline. */
 const RATES_TTL_MS = 24 * 60 * 60 * 1000;
-const SUBSCRIPTION_LIMITS_TTL_MS = 60 * 1000;
 
 /**
  * Files are filtered by mtime before opening. The slack covers a session whose
@@ -146,73 +149,79 @@ export const make = Effect.gen(function* () {
   let rates: RateTable = new Map();
   let ratesFetchedAtMs: number | null = null;
   let ratesStatus: UsageSummary["pricing"]["status"] = "unavailable";
-  const subscriptionLimitsCache = new Map<
-    UsageProviderKind,
-    {
-      readonly fetchedAtMs: number;
-      readonly limits: UsageProviderLimits;
-    }
-  >();
+  const subscriptionLimitsCache = new Map<UsageProviderKind, SubscriptionLimitsCacheEntry>();
 
   const readSubscriptionLimits = Effect.fn("UsageService.readSubscriptionLimits")(() =>
     subscriptionLimitsSemaphore.withPermits(1)(
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
-        const cachedLimits = new Map<UsageProviderKind, UsageProviderLimits>();
+        const cachedOutcomes = new Map<UsageProviderKind, SubscriptionLimitsProbeOutcome>();
         for (const [provider, cached] of subscriptionLimitsCache) {
-          if (now - cached.fetchedAtMs < SUBSCRIPTION_LIMITS_TTL_MS) {
-            cachedLimits.set(provider, cached.limits);
-          }
+          const outcome = readSubscriptionLimitsCacheEntry(cached, now);
+          if (outcome !== undefined) cachedOutcomes.set(provider, outcome);
+          else subscriptionLimitsCache.delete(provider);
         }
 
         const settings = yield* settingsService.getSettings.pipe(
           Effect.catchCause(() => Effect.succeed(null)),
         );
-        if (settings === null) return [...cachedLimits.values()];
+        if (settings === null) {
+          return [...cachedOutcomes.values()].flatMap((outcome) =>
+            outcome._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [],
+          );
+        }
 
         const cachedClaude = settings.providers.claudeAgent.enabled
-          ? cachedLimits.get("claude")
+          ? cachedOutcomes.get("claude")
           : undefined;
         const cachedCodex = settings.providers.codex.enabled
-          ? cachedLimits.get("codex")
+          ? cachedOutcomes.get("codex")
           : undefined;
 
-        const [claudeResponse, codexResponse] = yield* Effect.all(
+        const [claudeProbeOutcome, codexProbeOutcome] = yield* Effect.all(
           [
             settings.providers.claudeAgent.enabled && cachedClaude === undefined
-              ? probeClaudeUsage(settings.providers.claudeAgent, process.env, config.cwd).pipe(
-                  Effect.provideService(FileSystem.FileSystem, fileSystem),
-                  Effect.provideService(Path.Path, path),
-                  Effect.map(Option.fromUndefinedOr),
-                )
+              ? runSubscriptionLimitsProbe(
+                  probeClaudeUsage(settings.providers.claudeAgent, process.env, config.cwd).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    Effect.provideService(Path.Path, path),
+                  ),
+                  normalizeClaudeSubscriptionLimits,
+                ).pipe(Effect.map(Option.some))
               : Effect.succeed(Option.none()),
             settings.providers.codex.enabled && cachedCodex === undefined
-              ? probeCodexRateLimits(settings.providers.codex, process.env, config.cwd).pipe(
-                  Effect.provideService(
-                    ChildProcessSpawner.ChildProcessSpawner,
-                    childProcessSpawner,
+              ? runSubscriptionLimitsProbe(
+                  probeCodexRateLimits(settings.providers.codex, process.env, config.cwd).pipe(
+                    Effect.provideService(
+                      ChildProcessSpawner.ChildProcessSpawner,
+                      childProcessSpawner,
+                    ),
                   ),
-                  Effect.map(Option.fromUndefinedOr),
-                )
+                  normalizeCodexSubscriptionLimits,
+                ).pipe(Effect.map(Option.some))
               : Effect.succeed(Option.none()),
           ],
           { concurrency: "unbounded" },
         );
 
-        const claudeLimits =
-          cachedClaude ?? normalizeClaudeSubscriptionLimits(Option.getOrUndefined(claudeResponse));
-        const codexLimits =
-          cachedCodex ?? normalizeCodexSubscriptionLimits(Option.getOrUndefined(codexResponse));
+        const claudeOutcome = cachedClaude ?? Option.getOrUndefined(claudeProbeOutcome);
+        const codexOutcome = cachedCodex ?? Option.getOrUndefined(codexProbeOutcome);
         const fetchedAtMs = yield* Clock.currentTimeMillis;
-        for (const limits of [codexLimits, claudeLimits]) {
-          // Do not memoize a transient probe failure as a valid empty result.
-          // The next refresh should be able to recover that provider immediately.
-          if (limits !== null && !cachedLimits.has(limits.provider)) {
-            subscriptionLimitsCache.set(limits.provider, { fetchedAtMs, limits });
-          }
+        if (Option.isSome(claudeProbeOutcome)) {
+          subscriptionLimitsCache.set(
+            "claude",
+            makeSubscriptionLimitsCacheEntry(claudeProbeOutcome.value, fetchedAtMs),
+          );
         }
-        return [codexLimits, claudeLimits].filter(
-          (limits): limits is UsageProviderLimits => limits !== null,
+        if (Option.isSome(codexProbeOutcome)) {
+          subscriptionLimitsCache.set(
+            "codex",
+            makeSubscriptionLimitsCacheEntry(codexProbeOutcome.value, fetchedAtMs),
+          );
+        }
+
+        return [codexOutcome, claudeOutcome].flatMap((outcome) =>
+          outcome?._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [],
         );
       }),
     ),

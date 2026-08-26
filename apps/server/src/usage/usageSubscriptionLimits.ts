@@ -5,11 +5,72 @@ import type {
   UsageProviderLimits,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 
 const FIVE_HOURS_MINUTES = 5 * 60;
 const WEEK_MINUTES = 7 * 24 * 60;
 const UNLIMITED_CODEX_FIVE_HOUR_PLANS = new Set(["pro", "prolite"]);
+
+export const SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS = 5_000;
+export const SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS = 60_000;
+export const SUBSCRIPTION_LIMITS_FAILURE_TTL_MS = 5_000;
+
+export type SubscriptionLimitsProbeOutcome =
+  | {
+      readonly _tag: "Success";
+      readonly limits: UsageProviderLimits | null;
+    }
+  | { readonly _tag: "Failure" };
+
+export interface SubscriptionLimitsCacheEntry {
+  readonly expiresAtMs: number;
+  readonly outcome: SubscriptionLimitsProbeOutcome;
+}
+
+const subscriptionLimitsProbeFailure = { _tag: "Failure" } as const;
+
+/** Caps optional provider probes and preserves successful empty responses. */
+export const runSubscriptionLimitsProbe = Effect.fn("runSubscriptionLimitsProbe")(
+  <Response, Requirements>(
+    probe: Effect.Effect<Response | undefined, never, Requirements>,
+    normalize: (response: Response) => UsageProviderLimits | null,
+  ) =>
+    probe.pipe(
+      Effect.map(
+        (response): SubscriptionLimitsProbeOutcome =>
+          response === undefined
+            ? subscriptionLimitsProbeFailure
+            : { _tag: "Success", limits: normalize(response) },
+      ),
+      Effect.timeoutOption(SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS),
+      Effect.map(
+        Option.match({
+          onNone: () => subscriptionLimitsProbeFailure,
+          onSome: (outcome) => outcome,
+        }),
+      ),
+    ),
+);
+
+export function makeSubscriptionLimitsCacheEntry(
+  outcome: SubscriptionLimitsProbeOutcome,
+  nowMs: number,
+): SubscriptionLimitsCacheEntry {
+  const ttlMs =
+    outcome._tag === "Success"
+      ? SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS
+      : SUBSCRIPTION_LIMITS_FAILURE_TTL_MS;
+  return { expiresAtMs: nowMs + ttlMs, outcome };
+}
+
+export function readSubscriptionLimitsCacheEntry(
+  entry: SubscriptionLimitsCacheEntry | undefined,
+  nowMs: number,
+): SubscriptionLimitsProbeOutcome | undefined {
+  return entry !== undefined && nowMs < entry.expiresAtMs ? entry.outcome : undefined;
+}
 
 type ClaudeUsageLimitsResponse = Partial<
   Pick<SDKControlGetUsageResponse, "subscription_type" | "rate_limits_available" | "rate_limits">

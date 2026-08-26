@@ -1,8 +1,15 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it } from "@effect/vitest";
+import * as Duration from "effect/Duration";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 
 import {
+  makeSubscriptionLimitsCacheEntry,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
+  readSubscriptionLimitsCacheEntry,
+  runSubscriptionLimitsProbe,
 } from "./usageSubscriptionLimits.ts";
 
 describe("subscription usage limits", () => {
@@ -110,5 +117,43 @@ describe("subscription usage limits", () => {
     });
 
     expect(limits?.windows.map((window) => window.usedPercent)).toEqual([100, 0]);
+  });
+
+  it.effect("bounds a hanging provider probe at five seconds", () =>
+    Effect.gen(function* () {
+      const fiber = yield* runSubscriptionLimitsProbe(Effect.never, () => null).pipe(
+        Effect.forkScoped,
+      );
+
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.seconds(5));
+
+      expect(yield* Fiber.join(fiber)).toEqual({ _tag: "Failure" });
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("distinguishes a successful empty response from a failed probe", () =>
+    Effect.gen(function* () {
+      const outcome = yield* runSubscriptionLimitsProbe(Effect.succeed({}), () => null);
+
+      expect(outcome).toEqual({ _tag: "Success", limits: null });
+    }),
+  );
+
+  it("caches a successful empty response for the normal refresh interval", () => {
+    const entry = makeSubscriptionLimitsCacheEntry({ _tag: "Success", limits: null }, 1_000);
+
+    expect(readSubscriptionLimitsCacheEntry(entry, 60_999)).toEqual({
+      _tag: "Success",
+      limits: null,
+    });
+    expect(readSubscriptionLimitsCacheEntry(entry, 61_000)).toBeUndefined();
+  });
+
+  it("retries failed probes after a short backoff", () => {
+    const entry = makeSubscriptionLimitsCacheEntry({ _tag: "Failure" }, 1_000);
+
+    expect(readSubscriptionLimitsCacheEntry(entry, 5_999)).toEqual({ _tag: "Failure" });
+    expect(readSubscriptionLimitsCacheEntry(entry, 6_000)).toBeUndefined();
   });
 });
