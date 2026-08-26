@@ -6,6 +6,7 @@ import type {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 
@@ -13,7 +14,7 @@ const FIVE_HOURS_MINUTES = 5 * 60;
 const WEEK_MINUTES = 7 * 24 * 60;
 const UNLIMITED_CODEX_FIVE_HOUR_PLANS = new Set(["pro", "prolite"]);
 
-export const SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS = 5_000;
+export const SUBSCRIPTION_LIMITS_READ_BUDGET_MS = 5_000;
 export const SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS = 60_000;
 export const SUBSCRIPTION_LIMITS_FAILURE_TTL_MS = 5_000;
 
@@ -31,24 +32,30 @@ export interface SubscriptionLimitsCacheEntry {
 
 const subscriptionLimitsProbeFailure = { _tag: "Failure" } as const;
 
-/** Caps optional provider probes and preserves successful empty responses. */
+/** Tags provider responses so an empty response is distinct from a failed probe. */
 export const runSubscriptionLimitsProbe = Effect.fn("runSubscriptionLimitsProbe")(
   <Response, Requirements>(
     probe: Effect.Effect<Response | undefined, never, Requirements>,
     normalize: (response: Response) => UsageProviderLimits | null,
   ) =>
-    probe.pipe(
-      Effect.map(
-        (response): SubscriptionLimitsProbeOutcome =>
-          response === undefined
-            ? subscriptionLimitsProbeFailure
-            : { _tag: "Success", limits: normalize(response) },
-      ),
-      Effect.timeoutOption(SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS),
+    Effect.map(
+      probe,
+      (response): SubscriptionLimitsProbeOutcome =>
+        response === undefined
+          ? subscriptionLimitsProbeFailure
+          : { _tag: "Success", limits: normalize(response) },
+    ),
+);
+
+/** Bounds the page response without interrupting the service-owned probe fiber. */
+export const awaitSubscriptionLimits = Effect.fn("awaitSubscriptionLimits")(
+  (fiber: Fiber.Fiber<readonly UsageProviderLimits[], never>) =>
+    Fiber.join(fiber).pipe(
+      Effect.timeoutOption(SUBSCRIPTION_LIMITS_READ_BUDGET_MS),
       Effect.map(
         Option.match({
-          onNone: () => subscriptionLimitsProbeFailure,
-          onSome: (outcome) => outcome,
+          onNone: (): readonly UsageProviderLimits[] => [],
+          onSome: (limits) => limits,
         }),
       ),
     ),

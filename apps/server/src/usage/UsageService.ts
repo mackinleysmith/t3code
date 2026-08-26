@@ -26,13 +26,14 @@ import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
-import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Scope from "effect/Scope";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
@@ -58,6 +59,7 @@ import {
 } from "./usageScanCache.ts";
 import type { UsageRecord } from "./usageTranscripts.ts";
 import {
+  awaitSubscriptionLimits,
   makeSubscriptionLimitsCacheEntry,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
@@ -140,6 +142,8 @@ export const make = Effect.gen(function* () {
   const httpClient = yield* HttpClient.HttpClient;
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const subscriptionLimitsSemaphore = yield* Semaphore.make(1);
+  const subscriptionLimitsScope = yield* Scope.make("sequential");
+  yield* Effect.addFinalizer(() => Scope.close(subscriptionLimitsScope, Exit.void));
 
   const fileCache: ScanCache = new Map();
   let cacheDirty = false;
@@ -421,7 +425,7 @@ export const make = Effect.gen(function* () {
       // Subscription meters are optional. Provider payload drift must not make
       // transcript usage unavailable.
       Effect.catchCause(() => Effect.succeed([])),
-      Effect.forkChild,
+      Effect.forkIn(subscriptionLimitsScope),
     );
     yield* ensureRates();
     yield* ensureScanCacheLoaded;
@@ -520,7 +524,7 @@ export const make = Effect.gen(function* () {
     const aggregated = aggregator.finish();
     const readAt = yield* DateTime.now;
     const finishedAtMs = yield* Clock.currentTimeMillis;
-    const subscriptionLimits = yield* Fiber.join(subscriptionLimitsFiber);
+    const subscriptionLimits = yield* awaitSubscriptionLimits(subscriptionLimitsFiber);
 
     return {
       contractVersion: USAGE_CONTRACT_VERSION,

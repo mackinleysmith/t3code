@@ -1,3 +1,4 @@
+import type { UsageProviderLimits } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -5,6 +6,7 @@ import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 
 import {
+  awaitSubscriptionLimits,
   makeSubscriptionLimitsCacheEntry,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
@@ -119,24 +121,45 @@ describe("subscription usage limits", () => {
     expect(limits?.windows.map((window) => window.usedPercent)).toEqual([100, 0]);
   });
 
-  it.effect("bounds a hanging provider probe at five seconds", () =>
+  it.effect("returns after five seconds while a slow provider probe keeps running", () =>
     Effect.gen(function* () {
-      const fiber = yield* runSubscriptionLimitsProbe(Effect.never, () => null).pipe(
+      const limits = {
+        provider: "codex",
+        plan: "plus",
+        windows: [
+          {
+            kind: "weekly",
+            usedPercent: 42,
+            resetsAt: null,
+            unlimited: false,
+          },
+        ],
+      } satisfies UsageProviderLimits;
+      const providerFiber = yield* Effect.sleep(Duration.seconds(10)).pipe(
+        Effect.as([limits] as readonly UsageProviderLimits[]),
         Effect.forkScoped,
       );
+      const waitFiber = yield* awaitSubscriptionLimits(providerFiber).pipe(Effect.forkChild);
 
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(5));
 
-      expect(yield* Fiber.join(fiber)).toEqual({ _tag: "Failure" });
+      expect(yield* Fiber.join(waitFiber)).toEqual([]);
+
+      yield* TestClock.adjust(Duration.seconds(5));
+      expect(yield* Fiber.join(providerFiber)).toEqual([limits]);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 
   it.effect("distinguishes a successful empty response from a failed probe", () =>
     Effect.gen(function* () {
-      const outcome = yield* runSubscriptionLimitsProbe(Effect.succeed({}), () => null);
+      const [emptyOutcome, failedOutcome] = yield* Effect.all([
+        runSubscriptionLimitsProbe(Effect.succeed({}), () => null),
+        runSubscriptionLimitsProbe(Effect.void, () => null),
+      ]);
 
-      expect(outcome).toEqual({ _tag: "Success", limits: null });
+      expect(emptyOutcome).toEqual({ _tag: "Success", limits: null });
+      expect(failedOutcome).toEqual({ _tag: "Failure" });
     }),
   );
 
