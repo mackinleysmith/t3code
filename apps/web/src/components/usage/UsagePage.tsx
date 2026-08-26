@@ -17,6 +17,7 @@ import {
   formatPercent,
   formatTokens,
   formatUsageResetCountdown,
+  formatUsageResetDateTime,
   formatUsd,
   makeWindow,
 } from "@t3tools/shared/usageFormat";
@@ -513,7 +514,7 @@ function UsageLimitMeters({
     <div className="flex flex-col gap-2.5 pt-3 pb-1 pl-6">
       {limits.windows.map((window) => {
         const percent = Math.min(100, Math.max(0, window.usedPercent));
-        const reset = window.resetsAt ? formatDateTimeShort(window.resetsAt, timeZone) : null;
+        const reset = window.resetsAt ? formatUsageResetDateTime(window.resetsAt, timeZone) : null;
         const countdown = window.resetsAt
           ? formatUsageResetCountdown(window.resetsAt, nowMs)
           : null;
@@ -699,30 +700,50 @@ function UsageSkeleton() {
   return (
     <>
       <section className="grid gap-6 lg:grid-cols-[minmax(0,18rem)_minmax(0,1fr)]">
-        <div className="flex flex-col gap-5">
+        <div className="flex min-w-0 flex-col gap-6">
           <div className="flex flex-col gap-1">
             <div className="h-10 w-36 rounded-sm bg-muted" />
             <div className="h-4 w-32 rounded-sm bg-muted" />
           </div>
           {PROVIDER_ORDER.map((provider) => (
-            <div key={provider} className="flex flex-col gap-1">
-              <div className="flex min-h-5 items-center justify-between gap-4">
-                <span className="flex items-center gap-2">
-                  <span className="size-2 shrink-0 rounded-full bg-muted" />
-                  <span className="size-4 shrink-0 rounded-full bg-muted" />
-                  <div className="h-3.5 w-20 rounded-sm bg-muted" />
-                </span>
-                <div className="h-3.5 w-14 rounded-sm bg-muted" />
+            <div key={provider} className="flex flex-col gap-1.5">
+              <div className="flex flex-col gap-0.5">
+                <div className="flex min-h-5 items-center justify-between gap-4">
+                  <span className="flex items-center gap-2">
+                    <span className="size-4 shrink-0 rounded-full bg-muted" />
+                    <span className="flex items-baseline gap-1.5">
+                      <span className="h-3.5 w-20 rounded-sm bg-muted" />
+                      <span className="h-3 w-14 rounded-sm bg-muted" />
+                    </span>
+                  </span>
+                  <span className="h-3.5 w-14 rounded-sm bg-muted" />
+                </div>
+                <div className="ml-6 h-4 w-36 rounded-sm bg-muted" />
               </div>
-              <div className="h-4 w-36 rounded-sm bg-muted" />
+              <div className="flex flex-col gap-2.5 pt-3 pb-1 pl-6">
+                {["fiveHour", "weekly"].map((window) => (
+                  <div
+                    key={window}
+                    className="grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)_2.25rem] grid-rows-[auto_auto] items-center gap-x-2 gap-y-1"
+                  >
+                    <span className="col-start-1 row-start-1 h-2.5 w-5 rounded-sm bg-muted" />
+                    <span className="col-start-2 row-start-1 h-1 rounded-full bg-muted" />
+                    <span className="col-start-3 row-start-1 h-2.5 w-6 justify-self-end rounded-sm bg-muted" />
+                    <span className="col-start-2 row-start-2 h-2.5 w-20 rounded-sm bg-muted" />
+                  </div>
+                ))}
+              </div>
             </div>
           ))}
         </div>
 
-        <div className="flex flex-col gap-3">
+        <div className="flex min-w-0 flex-col gap-3 lg:h-full">
           <div className="h-5 w-24 rounded-sm bg-muted" />
-          <div className="flex flex-col gap-1">
-            <div className="ml-16 h-56 rounded-sm bg-muted/35" />
+          <div className="flex min-h-60 flex-1 flex-col gap-1">
+            <div className="flex min-h-56 flex-1 gap-2">
+              <div className="w-14 shrink-0" />
+              <div className="min-w-0 flex-1 rounded-sm bg-muted/35" />
+            </div>
             <div className="ml-16 h-4 rounded-sm bg-muted/35" />
           </div>
         </div>

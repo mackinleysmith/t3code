@@ -65,6 +65,23 @@ export function formatUsageResetCountdown(resetsAt: string, nowMs: number): stri
   return `${minutes}m`;
 }
 
+/** Exact reset instant for subscription-limit details, including minutes. */
+export function formatUsageResetDateTime(instant: string, timeZone?: string): string | null {
+  const date = new Date(instant);
+  if (Number.isNaN(date.getTime())) return null;
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      ...(timeZone === undefined ? {} : { timeZone }),
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(date);
+  } catch {
+    return null;
+  }
+}
+
 /** `2026-08-07` to `Aug 7`. */
 export function formatDayShort(day: string): string {
   const [year, month, dayOfMonth] = day.split("-").map((part) => Number(part));

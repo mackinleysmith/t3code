@@ -11,9 +11,8 @@ const FIVE_HOURS_MINUTES = 5 * 60;
 const WEEK_MINUTES = 7 * 24 * 60;
 const UNLIMITED_CODEX_FIVE_HOUR_PLANS = new Set(["pro", "prolite"]);
 
-type ClaudeUsageLimitsResponse = Pick<
-  SDKControlGetUsageResponse,
-  "subscription_type" | "rate_limits_available" | "rate_limits"
+type ClaudeUsageLimitsResponse = Partial<
+  Pick<SDKControlGetUsageResponse, "subscription_type" | "rate_limits_available" | "rate_limits">
 >;
 
 type CodexUsageLimitsResponse = Pick<CodexSchema.V2GetAccountRateLimitsResponse, "rateLimits">;
@@ -41,11 +40,13 @@ function claudeWindow(
 export function normalizeClaudeSubscriptionLimits(
   response: ClaudeUsageLimitsResponse | undefined,
 ): UsageProviderLimits | null {
-  if (!response?.rate_limits_available || response.rate_limits === null) return null;
+  const rateLimits = response?.rate_limits;
+  if (!response?.rate_limits_available || rateLimits === null || rateLimits === undefined)
+    return null;
 
   const windows = [
-    claudeWindow("fiveHour", response.rate_limits.five_hour),
-    claudeWindow("weekly", response.rate_limits.seven_day),
+    claudeWindow("fiveHour", rateLimits.five_hour),
+    claudeWindow("weekly", rateLimits.seven_day),
   ].filter((window): window is UsageLimitWindow => window !== null);
   if (windows.length === 0) return null;
 

@@ -231,7 +231,19 @@ describe("UsagePage subscription limits", () => {
     expect(markup).toContain("∞");
     expect(markup).toContain("No limit");
     expect(markup).toContain("Resets in");
+    expect(markup).toContain("Aug 29, 9:00 PM");
     expect(markup).toContain("of cost");
     expect(markup.indexOf("of cost")).toBeLessThan(markup.indexOf('aria-label="Codex 5h limit"'));
+  });
+
+  it("keeps the loading skeleton shaped like the quota-enabled provider rows", () => {
+    const current = testState.useUsage();
+    testState.useUsage.mockReturnValue({ ...current, isPending: true });
+
+    const markup = renderToStaticMarkup(<UsagePage />);
+
+    expect(markup.match(/grid-rows-\[auto_auto\]/g)).toHaveLength(4);
+    expect(markup).toContain("min-h-60 flex-1");
+    expect(markup).not.toContain("size-2 shrink-0 rounded-full bg-muted");
   });
 });

@@ -4,11 +4,14 @@ import {
   type UsageBucket,
   type UsageDay,
   type UsageProviderKind,
-  type UsageSummary,
+  UsageSummary,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import { mergeUsage, type EnvironmentUsage } from "./usageMerge.ts";
+
+const decodeUsageSummary = Schema.decodeUnknownSync(UsageSummary);
 
 function bucket(overrides: Partial<UsageBucket> = {}): UsageBucket {
   return {
@@ -168,6 +171,18 @@ describe("mergeUsage", () => {
 
     expect(merged.costUsd).toBe(10);
     expect(merged.staleEnvironments).toEqual(["env-b"]);
+  });
+
+  it("keeps v4 environment totals when subscription limits are absent", () => {
+    const current = summary([bucket()], [{ provider: "claude", hostId: "mac", homePath: "/a" }], 4);
+    const { subscriptionLimits: _subscriptionLimits, ...legacyPayload } = current;
+    const decoded = decodeUsageSummary(legacyPayload);
+
+    const merged = mergeUsage([environment("env-a", decoded)], USAGE_CONTRACT_VERSION);
+
+    expect(decoded.subscriptionLimits).toEqual([]);
+    expect(merged.costUsd).toBe(10);
+    expect(merged.staleEnvironments).toEqual([]);
   });
 
   it("derives provider shares and cost quality", () => {

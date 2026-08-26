@@ -7,6 +7,7 @@ import {
   formatHourShort,
   formatRelativeHourShort,
   formatUsageResetCountdown,
+  formatUsageResetDateTime,
   makeWindow,
 } from "./usageFormat.ts";
 
@@ -89,5 +90,11 @@ describe("subscription reset formatting", () => {
   it("handles reached and invalid reset times", () => {
     expect(formatUsageResetCountdown("2026-08-26T17:00:00.000Z", now)).toBe("now");
     expect(formatUsageResetCountdown("not-a-date", now)).toBeNull();
+  });
+
+  it("formats an exact reset time without throwing on malformed provider data", () => {
+    expect(formatUsageResetDateTime("2026-08-26T19:14:00.000Z", "UTC")).toBe("Aug 26, 7:14 PM");
+    expect(formatUsageResetDateTime("not-a-date", "UTC")).toBeNull();
+    expect(formatUsageResetDateTime("2026-08-26T19:14:00.000Z", "Etc/Unknown")).toBeNull();
   });
 });

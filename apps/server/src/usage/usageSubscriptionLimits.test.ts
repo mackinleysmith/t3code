@@ -46,6 +46,15 @@ describe("subscription usage limits", () => {
     ).toBeNull();
   });
 
+  it("omits Claude limits when the experimental response has no rate-limit payload", () => {
+    expect(
+      normalizeClaudeSubscriptionLimits({
+        subscription_type: "max",
+        rate_limits_available: true,
+      }),
+    ).toBeNull();
+  });
+
   it("normalizes Codex windows and Unix reset timestamps", () => {
     const limits = normalizeCodexSubscriptionLimits({
       rateLimits: {

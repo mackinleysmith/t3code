@@ -10,6 +10,7 @@ import {
   formatPercent,
   formatTokens,
   formatUsageResetCountdown,
+  formatUsageResetDateTime,
   formatUsd,
   makeWindow,
 } from "@t3tools/shared/usageFormat";
@@ -391,12 +392,7 @@ function UsageLimitMeters(props: {
       {props.limits.windows.map((window) => {
         const percent = Math.min(100, Math.max(0, window.usedPercent));
         const reset = window.resetsAt
-          ? new Intl.DateTimeFormat("en-US", {
-              timeZone: props.timeZone,
-              month: "short",
-              day: "numeric",
-              hour: "numeric",
-            }).format(new Date(window.resetsAt))
+          ? formatUsageResetDateTime(window.resetsAt, props.timeZone)
           : null;
         const countdown = window.resetsAt
           ? formatUsageResetCountdown(window.resetsAt, props.nowMs)
