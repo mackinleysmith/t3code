@@ -50,6 +50,14 @@ export interface CodexAppServerProviderSnapshot {
   readonly skills: ReadonlyArray<ServerProviderSkill>;
 }
 
+interface CodexAppServerProbeInput {
+  readonly binaryPath: string;
+  readonly homePath?: string;
+  readonly launchArgs?: string;
+  readonly cwd: string;
+  readonly environment?: NodeJS.ProcessEnv;
+}
+
 const REASONING_EFFORT_LABELS: Readonly<Record<string, string>> = {
   none: "None",
   minimal: "Minimal",
@@ -313,14 +321,9 @@ export function buildCodexInitializeParams(): CodexSchema.V1InitializeParams {
   };
 }
 
-const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (input: {
-  readonly binaryPath: string;
-  readonly homePath?: string;
-  readonly launchArgs?: string;
-  readonly cwd: string;
-  readonly customModels?: ReadonlyArray<string>;
-  readonly environment?: NodeJS.ProcessEnv;
-}) {
+const startCodexAppServerProbe = Effect.fn("startCodexAppServerProbe")(function* (
+  input: CodexAppServerProbeInput,
+) {
   // `~` is not shell-expanded when env vars are set via `child_process.spawn`,
   // so `CODEX_HOME=~/.codex_work` would reach codex verbatim and trip
   // "CODEX_HOME points to '~/.codex_work', but that path does not exist".
@@ -379,6 +382,16 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
   const versionMatch = initialize.userAgent.match(/\/([^\s]+)/);
   const version = versionMatch ? versionMatch[1] : undefined;
 
+  return { client, version } as const;
+});
+
+const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(function* (
+  input: CodexAppServerProbeInput & {
+    readonly customModels?: ReadonlyArray<string>;
+  },
+) {
+  const { client, version } = yield* startCodexAppServerProbe(input);
+
   const accountResponse = yield* client.request("account/read", {});
   if (!accountResponse.account && accountResponse.requiresOpenaiAuth) {
     return {
@@ -407,6 +420,33 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     ),
     skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
   } satisfies CodexAppServerProviderSnapshot;
+});
+
+/** Reads Codex's current ChatGPT subscription quota windows. */
+export const probeCodexRateLimits = Effect.fn("probeCodexRateLimits")(function* (
+  codexSettings: CodexSettings,
+  environment: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+) {
+  if (!codexSettings.enabled) return undefined;
+
+  const response = yield* Effect.gen(function* () {
+    const { client } = yield* startCodexAppServerProbe({
+      binaryPath: codexSettings.binaryPath,
+      homePath: codexSettings.homePath,
+      launchArgs: resolveCodexLaunchArgs(codexSettings.launchArgs, environment),
+      cwd,
+      environment,
+    });
+    return yield* client.request("account/rateLimits/read", undefined);
+  }).pipe(
+    Effect.scoped,
+    Effect.timeoutOption(Duration.millis(AUTH_PROBE_TIMEOUT_MS)),
+    Effect.result,
+  );
+
+  if (Result.isFailure(response) || Option.isNone(response.success)) return undefined;
+  return response.success.value;
 });
 
 const emptyCodexModelsFromSettings = (codexSettings: CodexSettings): ServerProvider["models"] => {

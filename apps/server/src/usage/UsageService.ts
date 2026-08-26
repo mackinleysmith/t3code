@@ -16,6 +16,7 @@ import * as NodeOS from "node:os";
 import {
   USAGE_CONTRACT_VERSION,
   type UsageProviderKind,
+  type UsageProviderLimits,
   type UsageSource,
   type UsageSummary,
   type UsageSummaryInput,
@@ -27,16 +28,20 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import { ServerConfig } from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { resolveClaudeHomePath } from "../provider/Drivers/ClaudeHome.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
+import { probeClaudeUsage } from "../provider/Layers/ClaudeProvider.ts";
+import { probeCodexRateLimits } from "../provider/Layers/CodexProvider.ts";
 import { UsageAggregator } from "./usageAggregation.ts";
 import { parseRateTable, type RateTable } from "./usagePricing.ts";
 import {
@@ -52,12 +57,18 @@ import {
   type ScanCache,
 } from "./usageScanCache.ts";
 import type { UsageRecord } from "./usageTranscripts.ts";
+import {
+  normalizeClaudeSubscriptionLimits,
+  normalizeCodexSubscriptionLimits,
+} from "./usageSubscriptionLimits.ts";
 
 const LITELLM_RATES_URL =
   "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 /** Rates move rarely; a day-old table keeps the page working offline. */
 const RATES_TTL_MS = 24 * 60 * 60 * 1000;
+const SUBSCRIPTION_LIMITS_TTL_MS = 60 * 1000;
+const SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS = 5_000;
 
 /**
  * Files are filtered by mtime before opening. The slack covers a session whose
@@ -106,6 +117,7 @@ export const layerTest = Layer.succeed(
         untilDay: input.untilDay,
         buckets: [],
         sources: [],
+        subscriptionLimits: [],
         pricing: {
           status: "unavailable",
           source: LITELLM_RATES_URL,
@@ -123,6 +135,7 @@ export const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const httpClient = yield* HttpClient.HttpClient;
+  const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 
   const fileCache: ScanCache = new Map();
   let cacheDirty = false;
@@ -132,6 +145,51 @@ export const make = Effect.gen(function* () {
   let rates: RateTable = new Map();
   let ratesFetchedAtMs: number | null = null;
   let ratesStatus: UsageSummary["pricing"]["status"] = "unavailable";
+  let subscriptionLimitsCache: {
+    readonly fetchedAtMs: number;
+    readonly limits: readonly UsageProviderLimits[];
+  } | null = null;
+
+  const readSubscriptionLimits = Effect.fn("UsageService.readSubscriptionLimits")(function* () {
+    const now = yield* Clock.currentTimeMillis;
+    if (
+      subscriptionLimitsCache !== null &&
+      now - subscriptionLimitsCache.fetchedAtMs < SUBSCRIPTION_LIMITS_TTL_MS
+    ) {
+      return subscriptionLimitsCache.limits;
+    }
+
+    const settings = yield* settingsService.getSettings.pipe(
+      Effect.catchCause(() => Effect.succeed(null)),
+    );
+    if (settings === null) return [];
+
+    const [claudeResponse, codexResponse] = yield* Effect.all(
+      [
+        settings.providers.claudeAgent.enabled
+          ? probeClaudeUsage(settings.providers.claudeAgent, process.env, config.cwd).pipe(
+              Effect.provideService(FileSystem.FileSystem, fileSystem),
+              Effect.provideService(Path.Path, path),
+              Effect.timeoutOption(SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS),
+              Effect.map(Option.getOrUndefined),
+            )
+          : Effect.succeed(undefined),
+        probeCodexRateLimits(settings.providers.codex, process.env, config.cwd).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, childProcessSpawner),
+          Effect.timeoutOption(SUBSCRIPTION_LIMITS_PROBE_TIMEOUT_MS),
+          Effect.map(Option.getOrUndefined),
+        ),
+      ],
+      { concurrency: "unbounded" },
+    );
+
+    const limits = [
+      normalizeCodexSubscriptionLimits(codexResponse),
+      normalizeClaudeSubscriptionLimits(claudeResponse),
+    ].filter((entry): entry is UsageProviderLimits => entry !== null);
+    subscriptionLimitsCache = { fetchedAtMs: now, limits };
+    return limits;
+  });
 
   /**
    * Loads the LiteLLM rate table, preferring a fresh copy and falling back to
@@ -323,6 +381,7 @@ export const make = Effect.gen(function* () {
     }
 
     const startedAtMs = yield* Clock.currentTimeMillis;
+    const subscriptionLimitsFiber = yield* readSubscriptionLimits().pipe(Effect.forkChild);
     yield* ensureRates();
     yield* ensureScanCacheLoaded;
 
@@ -420,6 +479,7 @@ export const make = Effect.gen(function* () {
     const aggregated = aggregator.finish();
     const readAt = yield* DateTime.now;
     const finishedAtMs = yield* Clock.currentTimeMillis;
+    const subscriptionLimits = yield* Fiber.join(subscriptionLimitsFiber);
 
     return {
       contractVersion: USAGE_CONTRACT_VERSION,
@@ -429,6 +489,7 @@ export const make = Effect.gen(function* () {
       untilDay: input.untilDay,
       buckets: aggregated.buckets,
       sources,
+      subscriptionLimits,
       pricing: {
         status: ratesStatus,
         source: LITELLM_RATES_URL,

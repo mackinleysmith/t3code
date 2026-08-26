@@ -6,6 +6,7 @@ import {
   formatDateTimeShort,
   formatHourShort,
   formatRelativeHourShort,
+  formatUsageResetCountdown,
   makeWindow,
 } from "./usageFormat.ts";
 
@@ -69,5 +70,24 @@ describe("hourly usage formatting", () => {
     } finally {
       resolvedOptions.mockRestore();
     }
+  });
+});
+
+describe("subscription reset formatting", () => {
+  const now = Date.parse("2026-08-26T17:00:00.000Z");
+
+  it("keeps short windows precise to the minute", () => {
+    expect(formatUsageResetCountdown("2026-08-26T19:14:00.000Z", now)).toBe("2h 14m");
+    expect(formatUsageResetCountdown("2026-08-26T17:00:01.000Z", now)).toBe("1m");
+  });
+
+  it("keeps weekly windows compact", () => {
+    expect(formatUsageResetCountdown("2026-08-29T21:00:00.000Z", now)).toBe("3d 4h");
+    expect(formatUsageResetCountdown("2026-08-29T17:45:00.000Z", now)).toBe("3d");
+  });
+
+  it("handles reached and invalid reset times", () => {
+    expect(formatUsageResetCountdown("2026-08-26T17:00:00.000Z", now)).toBe("now");
+    expect(formatUsageResetCountdown("not-a-date", now)).toBeNull();
   });
 });

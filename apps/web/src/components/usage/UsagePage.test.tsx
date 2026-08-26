@@ -49,6 +49,11 @@ vi.mock("../ui/select", () => ({
 }));
 vi.mock("../ui/sidebar", () => ({ SidebarInset: "div" }));
 vi.mock("../ui/toggle-group", () => ({ Toggle: "button", ToggleGroup: "div" }));
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: "div",
+  TooltipPopup: "div",
+  TooltipTrigger: "div",
+}));
 vi.mock("../WorkspaceBreadcrumb", () => ({
   WorkspaceBreadcrumb: "div",
   WorkspaceBreadcrumbItem: "div",
@@ -178,5 +183,55 @@ describe("UsagePage model breakdown", () => {
       "token-heavy-model",
       "token-heavy-cheaper-model",
     ]);
+  });
+});
+
+describe("UsagePage subscription limits", () => {
+  it("keeps provider share copy and adds compact quota meters", () => {
+    testState.useUsage.mockReturnValue({
+      merged: {
+        ...mergeUsage([], USAGE_CONTRACT_VERSION),
+        providers: [
+          {
+            provider: "codex",
+            costUsd: 12,
+            totalTokens: 2_000,
+            records: 2,
+            sessions: 1,
+            costShare: 1,
+            tokenShare: 1,
+          },
+        ],
+        subscriptionLimits: [
+          {
+            provider: "codex",
+            plan: "pro",
+            windows: [
+              { kind: "fiveHour", usedPercent: 0, resetsAt: null, unlimited: true },
+              {
+                kind: "weekly",
+                usedPercent: 8,
+                resetsAt: "2030-08-29T21:00:00.000Z",
+                unlimited: false,
+              },
+            ],
+          },
+        ],
+      },
+      environments: [],
+      isPending: false,
+      isPartial: false,
+      refresh: vi.fn(),
+    });
+
+    const markup = renderToStaticMarkup(<UsagePage />);
+
+    expect(markup).toContain('aria-label="Codex 5h limit"');
+    expect(markup).toContain('aria-label="Codex Week limit"');
+    expect(markup).toContain("∞");
+    expect(markup).toContain("No limit");
+    expect(markup).toContain("Resets in");
+    expect(markup).toContain("of cost");
+    expect(markup.indexOf("of cost")).toBeLessThan(markup.indexOf('aria-label="Codex 5h limit"'));
   });
 });

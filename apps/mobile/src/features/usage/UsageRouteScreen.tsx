@@ -1,4 +1,5 @@
 import { useNavigation } from "@react-navigation/native";
+import type { UsageLimitWindow, UsageProviderLimits } from "@t3tools/contracts";
 import type { DailyTotals, MergedUsage } from "@t3tools/shared/usageMerge";
 import {
   enumerateDays,
@@ -8,10 +9,11 @@ import {
   formatHourShort,
   formatPercent,
   formatTokens,
+  formatUsageResetCountdown,
   formatUsd,
   makeWindow,
 } from "@t3tools/shared/usageFormat";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Platform, Pressable, RefreshControl, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
@@ -41,9 +43,15 @@ export function UsageRouteScreen() {
     window: makeWindow(30),
   }));
   const [metric, setMetric] = useState<UsageChartMetric>("cost");
+  const [nowMs, setNowMs] = useState(Date.now());
   const { days: windowDays, window } = windowSelection;
   const isPast24Hours = windowDays === 1;
   const { merged, environments, isPending, isPartial, refresh } = useUsage(window);
+
+  useEffect(() => {
+    const interval = globalThis.setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => globalThis.clearInterval(interval);
+  }, []);
 
   const days = useMemo(
     () => enumerateDays(window.sinceDay, window.untilDay),
@@ -138,7 +146,12 @@ export function UsageRouteScreen() {
               isPast24Hours={isPast24Hours}
               timeZone={window.timeZone}
             />
-            <ProviderSection merged={merged} metric={metric} />
+            <ProviderSection
+              merged={merged}
+              metric={metric}
+              nowMs={nowMs}
+              timeZone={window.timeZone}
+            />
             <TotalsSection merged={merged} isPast24Hours={isPast24Hours} />
             <ModelsSection merged={merged} />
           </>
@@ -295,56 +308,150 @@ function MetricToggle(props: {
 function ProviderSection(props: {
   readonly merged: MergedUsage;
   readonly metric: UsageChartMetric;
+  readonly nowMs: number;
+  readonly timeZone: string;
 }) {
   const { merged, metric } = props;
   const colors = useProviderColors();
-  if (merged.providers.length === 0) return null;
+  if (merged.providers.length === 0 && merged.subscriptionLimits.length === 0) return null;
 
   // Ranked by whatever the toggle is showing, so the rows always descend.
   // .sort() on a copy, not .toSorted(): Hermes doesn't ship the ES2023 method.
   const ordered = [...merged.providers].sort((a, b) =>
     metric === "cost" ? b.costUsd - a.costUsd : b.totalTokens - a.totalTokens,
   );
+  const orderedProviders = [
+    ...ordered.map((provider) => provider.provider),
+    ...merged.subscriptionLimits
+      .map((limits) => limits.provider)
+      .filter((provider) => !ordered.some((entry) => entry.provider === provider)),
+  ];
 
   return (
     <SettingsSection title="Providers" card>
-      {ordered.map((provider, index) => {
-        const share = metric === "cost" ? provider.costShare : provider.tokenShare;
+      {orderedProviders.map((providerKind, index) => {
+        const provider = merged.providers.find((entry) => entry.provider === providerKind);
+        const limits = merged.subscriptionLimits.find((entry) => entry.provider === providerKind);
+        const share = metric === "cost" ? (provider?.costShare ?? 0) : (provider?.tokenShare ?? 0);
         return (
           <View
-            key={provider.provider}
+            key={providerKind}
             className={index === 0 ? "gap-2 p-4" : "gap-2 border-t border-border-subtle p-4"}
           >
-            <View className="flex-row items-baseline justify-between gap-3">
-              <View className="flex-row items-center gap-2">
-                <View
-                  className="size-2.5 rounded-full"
-                  style={{ backgroundColor: colors[provider.provider] }}
-                />
-                <Text className="text-lg text-foreground">{PROVIDER_LABEL[provider.provider]}</Text>
+            <View className="gap-0.5">
+              <View className="flex-row items-baseline justify-between gap-3">
+                <Text className="text-lg text-foreground">{PROVIDER_LABEL[providerKind]}</Text>
+                <Text className="text-lg tabular-nums text-foreground">
+                  {metric === "cost"
+                    ? formatUsd(provider?.costUsd ?? 0)
+                    : formatTokens(provider?.totalTokens ?? 0)}
+                </Text>
               </View>
-              <Text className="text-lg tabular-nums text-foreground">
+              <Text className="text-sm text-foreground-muted">
                 {metric === "cost"
-                  ? formatUsd(provider.costUsd)
-                  : formatTokens(provider.totalTokens)}
+                  ? `${formatPercent(share)} of cost · ${formatTokens(provider?.totalTokens ?? 0)} tokens`
+                  : `${formatPercent(share)} of tokens · ${formatUsd(provider?.costUsd ?? 0)}`}
               </Text>
             </View>
             <View className="h-1 flex-row overflow-hidden rounded-full bg-subtle">
               <View
                 className="h-full rounded-full"
-                style={{ flex: share, backgroundColor: colors[provider.provider] }}
+                style={{ flex: share, backgroundColor: colors[providerKind] }}
               />
               <View style={{ flex: 1 - share }} />
             </View>
-            <Text className="text-sm text-foreground-muted">
-              {metric === "cost"
-                ? `${formatPercent(share)} of cost · ${formatTokens(provider.totalTokens)} tokens`
-                : `${formatPercent(share)} of tokens · ${formatUsd(provider.costUsd)}`}
-            </Text>
+            {limits ? (
+              <UsageLimitMeters
+                limits={limits}
+                color={colors[providerKind]}
+                nowMs={props.nowMs}
+                timeZone={props.timeZone}
+              />
+            ) : null}
           </View>
         );
       })}
     </SettingsSection>
+  );
+}
+
+const LIMIT_WINDOW_LABEL: Record<UsageLimitWindow["kind"], string> = {
+  fiveHour: "5h",
+  weekly: "Week",
+};
+
+function UsageLimitMeters(props: {
+  readonly limits: UsageProviderLimits;
+  readonly color: string;
+  readonly nowMs: number;
+  readonly timeZone: string;
+}) {
+  return (
+    <View className="gap-2.5 py-1">
+      {props.limits.windows.map((window) => {
+        const percent = Math.min(100, Math.max(0, window.usedPercent));
+        const reset = window.resetsAt
+          ? new Intl.DateTimeFormat("en-US", {
+              timeZone: props.timeZone,
+              month: "short",
+              day: "numeric",
+              hour: "numeric",
+            }).format(new Date(window.resetsAt))
+          : null;
+        const countdown = window.resetsAt
+          ? formatUsageResetCountdown(window.resetsAt, props.nowMs)
+          : null;
+        const label = LIMIT_WINDOW_LABEL[window.kind];
+        return (
+          <View key={window.kind} className="gap-1">
+            <View className="flex-row items-center gap-2">
+              <Text className="w-9 text-xs text-foreground-muted">{label}</Text>
+              <View
+                accessibilityRole="progressbar"
+                accessibilityLabel={`${PROVIDER_LABEL[props.limits.provider]} ${label} limit`}
+                accessibilityHint={
+                  window.unlimited
+                    ? "No five-hour limit on this plan"
+                    : reset
+                      ? `Resets ${reset}`
+                      : undefined
+                }
+                accessibilityValue={
+                  window.unlimited
+                    ? { text: "Unlimited" }
+                    : { min: 0, max: 100, now: Math.round(percent) }
+                }
+                className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-subtle"
+              >
+                <View
+                  className="h-full rounded-full"
+                  style={{
+                    width: window.unlimited ? "100%" : `${percent}%`,
+                    backgroundColor: props.color,
+                    opacity: window.unlimited ? 0.45 : 1,
+                  }}
+                />
+              </View>
+              <Text className="w-9 text-right text-xs tabular-nums text-foreground-muted">
+                {window.unlimited ? "∞" : `${Math.round(percent)}%`}
+              </Text>
+            </View>
+            <Text
+              numberOfLines={1}
+              className="mx-11 text-[11px] tabular-nums text-foreground-tertiary"
+            >
+              {window.unlimited
+                ? "No limit"
+                : countdown === "now"
+                  ? "Reset due"
+                  : countdown
+                    ? `Resets in ${countdown}`
+                    : "Reset time unavailable"}
+            </Text>
+          </View>
+        );
+      })}
+    </View>
   );
 }
 

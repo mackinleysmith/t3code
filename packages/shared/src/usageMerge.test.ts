@@ -50,6 +50,7 @@ function summary(
     sinceDay: "2026-08-01" as UsageDay,
     untilDay: "2026-08-31" as UsageDay,
     buckets,
+    subscriptionLimits: [],
     sources: sources.map((source) => ({
       fingerprint: {
         hostId: source.hostId,
@@ -262,6 +263,46 @@ describe("mergeUsage", () => {
     expect(merged.costUsd).toBe(0);
     expect(merged.daily).toHaveLength(0);
     expect(merged.hourly).toHaveLength(0);
+  });
+
+  it("uses the newest subscription limits reported for each provider", () => {
+    const older = summary([], []);
+    const newer = summary([], []);
+    const merged = mergeUsage(
+      [
+        environment("env-a", {
+          ...older,
+          readAt: "2026-08-07T10:00:00.000Z",
+          subscriptionLimits: [
+            {
+              provider: "codex",
+              plan: "plus",
+              windows: [{ kind: "fiveHour", usedPercent: 20, resetsAt: null, unlimited: false }],
+            },
+          ],
+        }),
+        environment("env-b", {
+          ...newer,
+          readAt: "2026-08-07T11:00:00.000Z",
+          subscriptionLimits: [
+            {
+              provider: "codex",
+              plan: "pro",
+              windows: [{ kind: "fiveHour", usedPercent: 35, resetsAt: null, unlimited: false }],
+            },
+          ],
+        }),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(merged.subscriptionLimits).toEqual([
+      {
+        provider: "codex",
+        plan: "pro",
+        windows: [{ kind: "fiveHour", usedPercent: 35, resetsAt: null, unlimited: false }],
+      },
+    ]);
   });
 
   it("omits providers with no sessions or usage", () => {
