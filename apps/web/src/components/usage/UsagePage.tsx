@@ -44,6 +44,10 @@ const WINDOW_OPTIONS = [
   { days: 90, label: "90 days" },
 ] as const;
 
+const USAGE_LIMITS_CLASS_NAME = "flex flex-col gap-2.5 pt-3 pb-1 pl-6";
+const USAGE_LIMIT_ROW_CLASS_NAME =
+  "grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)_2.25rem] grid-rows-[auto_auto] items-center gap-x-2 gap-y-1";
+
 export function UsagePage() {
   const [windowSelection, setWindowSelection] = useState(() => ({
     days: 30,
@@ -511,7 +515,7 @@ function UsageLimitMeters({
 }) {
   const providerLabel = PROVIDER_PRESENTATION[limits.provider].label;
   return (
-    <div className="flex flex-col gap-2.5 pt-3 pb-1 pl-6">
+    <div className={USAGE_LIMITS_CLASS_NAME}>
       {limits.windows.map((window) => {
         const percent = Math.min(100, Math.max(0, window.usedPercent));
         const reset = window.resetsAt ? formatUsageResetDateTime(window.resetsAt, timeZone) : null;
@@ -525,11 +529,7 @@ function UsageLimitMeters({
           : `${Math.round(percent)}% used.${resetText}`;
         return (
           <Tooltip key={window.kind}>
-            <TooltipTrigger
-              render={
-                <div className="grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)_2.25rem] grid-rows-[auto_auto] items-center gap-x-2 gap-y-1" />
-              }
-            >
+            <TooltipTrigger render={<div className={USAGE_LIMIT_ROW_CLASS_NAME} />}>
               <span className="col-start-1 row-start-1 text-[10px] leading-none text-muted-foreground">
                 {label}
               </span>
@@ -548,9 +548,6 @@ function UsageLimitMeters({
                     width: window.unlimited ? "100%" : `${percent}%`,
                     backgroundColor: PROVIDER_PRESENTATION[limits.provider].color,
                     opacity: window.unlimited ? 0.45 : 1,
-                    boxShadow: window.unlimited
-                      ? `0 0 6px color-mix(in srgb, ${PROVIDER_PRESENTATION[limits.provider].color} 45%, transparent)`
-                      : undefined,
                   }}
                 />
               </span>
@@ -720,12 +717,9 @@ function UsageSkeleton() {
                 </div>
                 <div className="ml-6 h-4 w-36 rounded-sm bg-muted" />
               </div>
-              <div className="flex flex-col gap-2.5 pt-3 pb-1 pl-6">
+              <div className={USAGE_LIMITS_CLASS_NAME}>
                 {["fiveHour", "weekly"].map((window) => (
-                  <div
-                    key={window}
-                    className="grid min-w-0 grid-cols-[2.25rem_minmax(0,1fr)_2.25rem] grid-rows-[auto_auto] items-center gap-x-2 gap-y-1"
-                  >
+                  <div key={window} className={USAGE_LIMIT_ROW_CLASS_NAME}>
                     <span className="col-start-1 row-start-1 h-2.5 w-5 rounded-sm bg-muted" />
                     <span className="col-start-2 row-start-1 h-1 rounded-full bg-muted" />
                     <span className="col-start-3 row-start-1 h-2.5 w-6 justify-self-end rounded-sm bg-muted" />
