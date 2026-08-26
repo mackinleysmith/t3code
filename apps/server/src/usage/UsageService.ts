@@ -181,6 +181,13 @@ export const make = Effect.gen(function* () {
         const cachedCodex = settings.providers.codex.enabled
           ? cachedOutcomes.get("codex")
           : undefined;
+        const codexHomeLayout = yield* resolveCodexHomeLayout(settings.providers.codex).pipe(
+          Effect.provideService(Path.Path, path),
+        );
+        const codexProbeSettings = {
+          ...settings.providers.codex,
+          homePath: codexHomeLayout.effectiveHomePath ?? "",
+        };
 
         const [claudeProbeOutcome, codexProbeOutcome] = yield* Effect.all(
           [
@@ -195,7 +202,7 @@ export const make = Effect.gen(function* () {
               : Effect.succeed(Option.none()),
             settings.providers.codex.enabled && cachedCodex === undefined
               ? runSubscriptionLimitsProbe(
-                  probeCodexRateLimits(settings.providers.codex, process.env, config.cwd).pipe(
+                  probeCodexRateLimits(codexProbeSettings, process.env, config.cwd).pipe(
                     Effect.provideService(
                       ChildProcessSpawner.ChildProcessSpawner,
                       childProcessSpawner,
