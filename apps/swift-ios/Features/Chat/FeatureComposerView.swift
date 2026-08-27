@@ -234,6 +234,7 @@ struct FeatureComposerView: View {
                     focused: $focused,
                     placeholder: composerPlaceholder,
                     acceptsImages: imagesAllowed,
+                    skills: powerFeatures.skills,
                     selectionRequest: textSelectionRequest,
                     onPasteImages: attachImageProviders,
                     onDismissKeyboard: onDismissKeyboard

@@ -562,6 +562,7 @@ public struct ThreadDetailView: View {
                     threadID: thread.id,
                     messages: timelineMessages(detail.messages),
                     imageContext: markdownImageContext,
+                    skills: threadProviderSkills,
                     renderUpdate: timelineRenderUpdate,
                     dynamicTypeSize: dynamicTypeSize,
                     isWorking: isWorking,
@@ -636,6 +637,11 @@ public struct ThreadDetailView: View {
     private var threadProviders: [FeatureProvider] {
         let project = model.snapshot.projects.first { $0.id == currentThread.projectID }
         return DailyUXCreationContext.providers(for: project, in: model.snapshot)
+    }
+
+    private var threadProviderSkills: [FeatureProviderSkill] {
+        guard let selectedProviderID = currentSelection?.providerID else { return [] }
+        return threadProviders.first { $0.id == selectedProviderID }?.skills ?? []
     }
 
     private var timelineRenderUpdate: FeatureDetailRenderUpdate? {
@@ -1040,6 +1046,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
     let threadID: String
     let messages: [FeatureMessage]
     let imageContext: MarkdownImageContext?
+    let skills: [FeatureProviderSkill]
     let renderUpdate: FeatureDetailRenderUpdate?
     let dynamicTypeSize: DynamicTypeSize
     let isWorking: Bool
@@ -1076,6 +1083,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             threadID: threadID,
             messages: messages,
             imageContext: imageContext,
+            skills: skills,
             renderUpdate: renderUpdate,
             dynamicTypeSize: dynamicTypeSize,
             isWorking: isWorking,
@@ -1127,6 +1135,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
         private var currentImageContext: MarkdownImageContext?
+        private var currentSkills: [FeatureProviderSkill] = []
         private var currentDetailRevision: UInt64?
         private var currentDynamicTypeSize: DynamicTypeSize?
         private var currentIsWorking = false
@@ -1177,7 +1186,11 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 }
 
                 cell.contentConfiguration = UIHostingConfiguration {
-                    FeatureMessageView(message: message, imageContext: self?.currentImageContext)
+                    FeatureMessageView(
+                        message: message,
+                        imageContext: self?.currentImageContext,
+                        skills: self?.currentSkills ?? []
+                    )
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .margins(.all, 0)
@@ -1202,6 +1215,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             threadID: String,
             messages: [FeatureMessage],
             imageContext: MarkdownImageContext?,
+            skills: [FeatureProviderSkill],
             renderUpdate: FeatureDetailRenderUpdate?,
             dynamicTypeSize: DynamicTypeSize,
             isWorking: Bool,
@@ -1220,6 +1234,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
 
             let threadChanged = currentThreadID != threadID
             let imageContextChanged = currentImageContext != imageContext
+            let skillsChanged = currentSkills != skills
             let typeSizeChanged = currentDynamicTypeSize != dynamicTypeSize
             let revisionChanged = currentDetailRevision != renderUpdate?.revision
             let workingChanged = currentIsWorking != isWorking
@@ -1228,7 +1243,8 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                 || currentIsMonitoring != isMonitoring
             let loadEarlierChanged = currentCanLoadEarlier != canLoadEarlier
                 || currentIsLoadingEarlier != isLoadingEarlier
-            guard threadChanged || imageContextChanged || typeSizeChanged || revisionChanged || workingChanged
+            guard threadChanged || imageContextChanged || skillsChanged || typeSizeChanged
+                || revisionChanged || workingChanged
                 || workingDetailChanged || loadEarlierChanged else { return }
 
             let incremental = !threadChanged
@@ -1237,11 +1253,12 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             let state = incremental ?? fullState(messages: messages)
             let newIDs = state.ids
             let idsChanged = state.idsChanged
-            let changedIDs = typeSizeChanged || imageContextChanged
+            let changedIDs = typeSizeChanged || imageContextChanged || skillsChanged
                 ? newIDs
                 : state.changedIDs
 
             currentImageContext = imageContext
+            currentSkills = skills
             currentDetailRevision = renderUpdate?.revision
             currentDynamicTypeSize = dynamicTypeSize
             currentIsWorking = isWorking
@@ -2145,6 +2162,7 @@ private enum FeatureAttachmentThumbnailError: Error {
 struct FeatureMessageView: View {
     let message: FeatureMessage
     var imageContext: MarkdownImageContext? = nil
+    var skills: [FeatureProviderSkill] = []
 
     var body: some View {
         switch message.role {
@@ -2157,7 +2175,8 @@ struct FeatureMessageView: View {
                         MarkdownMessageView(
                             message.text,
                             isStreaming: message.state == .streaming,
-                            imageContext: imageContext
+                            imageContext: imageContext,
+                            skills: skills
                         )
                     }
                 }
@@ -2192,7 +2211,8 @@ struct FeatureMessageView: View {
                     MarkdownMessageView(
                         message.text,
                         isStreaming: message.state == .streaming,
-                        imageContext: imageContext
+                        imageContext: imageContext,
+                        skills: skills
                     )
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
