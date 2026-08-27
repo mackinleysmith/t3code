@@ -162,7 +162,7 @@ describe("mergeUsage", () => {
           summary(
             [bucket()],
             [{ provider: "claude", hostId: "linux", homePath: "/b" }],
-            USAGE_CONTRACT_VERSION - 1,
+            USAGE_CONTRACT_VERSION - 2,
           ),
         ),
       ],
@@ -182,6 +182,32 @@ describe("mergeUsage", () => {
 
     expect(decoded.subscriptionLimits).toEqual([]);
     expect(merged.costUsd).toBe(10);
+    expect(merged.staleEnvironments).toEqual([]);
+  });
+
+  it("keeps the previous compatible contract version so additive provider expansions still merge", () => {
+    const merged = mergeUsage(
+      [
+        environment(
+          "env-a",
+          summary(
+            [bucket({ costUsd: 10 })],
+            [{ provider: "claude", hostId: "mac", homePath: "/a" }],
+          ),
+        ),
+        environment(
+          "env-b",
+          summary(
+            [bucket({ costUsd: 4, provider: "codex", model: "gpt-5.6-sol" })],
+            [{ provider: "codex", hostId: "linux", homePath: "/b" }],
+            USAGE_CONTRACT_VERSION - 1,
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(merged.costUsd).toBe(14);
     expect(merged.staleEnvironments).toEqual([]);
   });
 
