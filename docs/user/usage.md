@@ -8,10 +8,11 @@ cost shown here.
 When a signed-in provider exposes subscription quotas, its summary row keeps the usual cost and
 token summary and adds the current five-hour and weekly usage meters. Each meter shows the time
 remaining until it resets. On web and desktop, hover a meter to see the exact reset time. Providers
-that do not expose quota data omit the meters.
+that do not expose quota data omit the meters. Claude also shows model-scoped weekly windows, such
+as Fable, when the subscription reports them.
 
-Codex Pro 5x and Pro 20x plans show `∞` for the uncapped five-hour window. Plus plans show the
-five-hour percentage reported by Codex.
+Codex shows `∞` only when the provider explicitly reports unlimited credits. Otherwise it shows
+only the quota windows returned for the signed-in Codex plan.
 
 Use **Past 24h** for an hourly chart covering the exact rolling 24-hour period. The **7 days**,
 **30 days**, and **90 days** ranges use daily resolution. Cost and token toggles update both the

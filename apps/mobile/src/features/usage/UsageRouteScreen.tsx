@@ -376,10 +376,12 @@ function ProviderSection(props: {
   );
 }
 
-const LIMIT_WINDOW_LABEL: Record<UsageLimitWindow["kind"], string> = {
-  fiveHour: "5h",
-  weekly: "Week",
-};
+function usageLimitWindowLabel(window: UsageLimitWindow): string {
+  if (window.label) return window.label;
+  if (window.kind === "fiveHour") return "5h";
+  if (window.kind === "weekly") return "Week";
+  return window.kind;
+}
 
 function UsageLimitMeters(props: {
   readonly limits: UsageProviderLimits;
@@ -397,9 +399,9 @@ function UsageLimitMeters(props: {
         const countdown = window.resetsAt
           ? formatUsageResetCountdown(window.resetsAt, props.nowMs)
           : null;
-        const label = LIMIT_WINDOW_LABEL[window.kind];
+        const label = usageLimitWindowLabel(window);
         return (
-          <View key={window.kind} className="gap-1">
+          <View key={`${window.kind}:${label}`} className="gap-1">
             <View className="flex-row items-center gap-2">
               <Text className="w-9 text-xs text-foreground-muted">{label}</Text>
               <View

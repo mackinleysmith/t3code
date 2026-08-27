@@ -161,12 +161,15 @@ export const UsagePricing = Schema.Struct({
 });
 export type UsagePricing = typeof UsagePricing.Type;
 
-export const UsageLimitWindowKind = Schema.Literals(["fiveHour", "weekly"]);
+/** Provider-stable identifier for a subscription quota window. */
+export const UsageLimitWindowKind = TrimmedNonEmptyString;
 export type UsageLimitWindowKind = typeof UsageLimitWindowKind.Type;
 
 /** One subscription quota window reported by the provider CLI. */
 export const UsageLimitWindow = Schema.Struct({
   kind: UsageLimitWindowKind,
+  /** Provider-facing label. Optional so contract-v4 clients can decode older servers. */
+  label: Schema.optionalKey(TrimmedNonEmptyString),
   usedPercent: Schema.Number,
   resetsAt: Schema.NullOr(Schema.String),
   /** True when this plan has no cap for the window. */

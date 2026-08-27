@@ -61,6 +61,7 @@ import type { UsageRecord } from "./usageTranscripts.ts";
 import {
   awaitSubscriptionLimits,
   makeSubscriptionLimitsCacheEntry,
+  makeSubscriptionLimitsDevFixture,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
   readSubscriptionLimitsCacheEntry,
@@ -159,6 +160,13 @@ export const make = Effect.gen(function* () {
     subscriptionLimitsSemaphore.withPermits(1)(
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis;
+        const fixture = makeSubscriptionLimitsDevFixture(
+          config.devUrl !== undefined,
+          process.env.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
+          now,
+        );
+        if (fixture !== null) return fixture;
+
         const cachedOutcomes = new Map<UsageProviderKind, SubscriptionLimitsProbeOutcome>();
         for (const [provider, cached] of subscriptionLimitsCache) {
           const outcome = readSubscriptionLimitsCacheEntry(cached, now);

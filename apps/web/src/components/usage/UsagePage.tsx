@@ -499,10 +499,12 @@ function ProviderMark({
   return <Mark className={cn("shrink-0", className)} aria-hidden />;
 }
 
-const LIMIT_WINDOW_LABEL: Record<UsageLimitWindow["kind"], string> = {
-  fiveHour: "5h",
-  weekly: "Week",
-};
+function usageLimitWindowLabel(window: UsageLimitWindow): string {
+  if (window.label) return window.label;
+  if (window.kind === "fiveHour") return "5h";
+  if (window.kind === "weekly") return "Week";
+  return window.kind;
+}
 
 function UsageLimitMeters({
   limits,
@@ -522,13 +524,13 @@ function UsageLimitMeters({
         const countdown = window.resetsAt
           ? formatUsageResetCountdown(window.resetsAt, nowMs)
           : null;
-        const label = LIMIT_WINDOW_LABEL[window.kind];
+        const label = usageLimitWindowLabel(window);
         const resetText = reset ? ` Resets ${reset}.` : "";
         const usageText = window.unlimited
           ? "Unlimited. No five-hour limit on this plan."
           : `${Math.round(percent)}% used.${resetText}`;
         return (
-          <Tooltip key={window.kind}>
+          <Tooltip key={`${window.kind}:${label}`}>
             <TooltipTrigger render={<div className={USAGE_LIMIT_ROW_CLASS_NAME} />}>
               <span className="col-start-1 row-start-1 text-[10px] leading-none text-muted-foreground">
                 {label}
