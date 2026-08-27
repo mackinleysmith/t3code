@@ -37,14 +37,12 @@ describe("subscription usage limits", () => {
           label: "5h",
           usedPercent: 10.4,
           resetsAt: "2026-08-26T19:00:00.000Z",
-          unlimited: false,
         },
         {
           kind: "weekly",
           label: "Week",
           usedPercent: 3,
           resetsAt: "2026-09-01T23:00:00.000Z",
-          unlimited: false,
         },
       ],
     });
@@ -75,14 +73,12 @@ describe("subscription usage limits", () => {
         label: "Week",
         usedPercent: 3,
         resetsAt: "2026-09-01T23:00:00.000Z",
-        unlimited: false,
       },
       {
         kind: "weekly:fable",
         label: "Fable",
         usedPercent: 95,
         resetsAt: "2026-09-01T23:00:00.000Z",
-        unlimited: false,
       },
     ]);
   });
@@ -107,7 +103,6 @@ describe("subscription usage limits", () => {
         label: "Future Model",
         usedPercent: 72,
         resetsAt: "2026-09-01T23:00:00.000Z",
-        unlimited: false,
       },
     ]);
   });
@@ -149,14 +144,13 @@ describe("subscription usage limits", () => {
           label: "5h",
           usedPercent: 42,
           resetsAt: "2026-08-29T10:40:00.000Z",
-          unlimited: false,
         },
-        { kind: "weekly", label: "Week", usedPercent: 8, resetsAt: null, unlimited: false },
+        { kind: "weekly", label: "Week", usedPercent: 8, resetsAt: null },
       ],
     });
   });
 
-  it("does not invent an unlimited window from the Codex plan name", () => {
+  it("does not invent a five-hour window from the Codex plan name", () => {
     const limits = normalizeCodexSubscriptionLimits({
       rateLimits: {
         planType: "pro",
@@ -165,7 +159,7 @@ describe("subscription usage limits", () => {
     });
 
     expect(limits?.windows).toEqual([
-      { kind: "weekly", label: "Week", usedPercent: 44, resetsAt: null, unlimited: false },
+      { kind: "weekly", label: "Week", usedPercent: 44, resetsAt: null },
     ]);
   });
 
@@ -194,9 +188,8 @@ describe("subscription usage limits", () => {
         label: "Week",
         usedPercent: 44,
         resetsAt: null,
-        unlimited: false,
       },
-      { kind: "monthly", label: "Month", usedPercent: 12, resetsAt: null, unlimited: false },
+      { kind: "monthly", label: "Month", usedPercent: 12, resetsAt: null },
     ]);
 
     expect(
@@ -226,14 +219,12 @@ describe("subscription usage limits", () => {
         label: "Usage",
         usedPercent: 44,
         resetsAt: null,
-        unlimited: false,
       },
       {
         kind: "codex:secondary",
         label: "Secondary",
         usedPercent: 12,
         resetsAt: null,
-        unlimited: false,
       },
     ]);
   });
@@ -297,7 +288,6 @@ describe("subscription usage limits", () => {
             kind: "weekly",
             usedPercent: 42,
             resetsAt: null,
-            unlimited: false,
           },
         ],
       } satisfies UsageProviderLimits;
@@ -336,7 +326,6 @@ describe("subscription usage limits", () => {
             kind: "weekly",
             usedPercent: 42,
             resetsAt: null,
-            unlimited: false,
           },
         ],
       } satisfies UsageProviderLimits;
@@ -428,7 +417,6 @@ describe("subscription usage limits", () => {
               label: "Week",
               usedPercent: 57,
               resetsAt: null,
-              unlimited: false,
             },
           ],
         },
@@ -448,7 +436,6 @@ describe("subscription usage limits", () => {
             label: "Week",
             usedPercent: 57,
             resetsAt: null,
-            unlimited: false,
           },
         ],
         observedAt: "1970-01-01T00:00:01.000Z",
@@ -471,7 +458,6 @@ describe("subscription usage limits", () => {
             label: "Week",
             usedPercent: 47,
             resetsAt: "2026-09-04T10:40:00.000Z",
-            unlimited: false,
           },
         ],
       },
@@ -484,21 +470,18 @@ describe("subscription usage limits", () => {
             label: "5h",
             usedPercent: 68,
             resetsAt: "2026-08-29T12:40:00.000Z",
-            unlimited: false,
           },
           {
             kind: "weekly",
             label: "Week",
             usedPercent: 32,
             resetsAt: "2026-09-03T10:40:00.000Z",
-            unlimited: false,
           },
           {
             kind: "weekly:fable",
             label: "Fable",
             usedPercent: 91,
             resetsAt: "2026-09-02T10:40:00.000Z",
-            unlimited: false,
           },
         ],
       },

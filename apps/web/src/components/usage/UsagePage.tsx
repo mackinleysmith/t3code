@@ -543,9 +543,7 @@ function UsageLimitMeters({
           : null;
         const label = usageLimitWindowLabel(window);
         const resetText = reset ? ` Resets ${reset}.` : "";
-        const usageText = window.unlimited
-          ? "Unlimited. No limit on this plan."
-          : `${Math.round(percent)}% used.${resetText}`;
+        const usageText = `${Math.round(percent)}% used.${resetText}`;
         return (
           <Tooltip key={`${window.kind}:${label}`}>
             <TooltipTrigger render={<div className={USAGE_LIMIT_ROW_CLASS_NAME} />}>
@@ -557,41 +555,32 @@ function UsageLimitMeters({
                 aria-label={`${providerLabel} ${label} limit`}
                 aria-valuemin={0}
                 aria-valuemax={100}
-                aria-valuenow={window.unlimited ? undefined : Math.round(percent)}
+                aria-valuenow={Math.round(percent)}
                 aria-valuetext={usageText}
                 className="col-start-2 row-start-1 h-1 overflow-hidden rounded-full bg-muted"
               >
                 <span
                   className="block h-full rounded-full"
                   style={{
-                    width: window.unlimited ? "100%" : `${percent}%`,
+                    width: `${percent}%`,
                     backgroundColor: PROVIDER_PRESENTATION[limits.provider].color,
-                    opacity: window.unlimited ? 0.45 : 1,
                   }}
                 />
               </span>
-              <span
-                className={cn(
-                  "col-start-3 row-start-1 text-right text-[10px] leading-none text-muted-foreground tabular-nums",
-                  window.unlimited && "text-foreground",
-                )}
-              >
-                {window.unlimited ? "∞" : `${Math.round(percent)}%`}
+              <span className="col-start-3 row-start-1 text-right text-[10px] leading-none text-muted-foreground tabular-nums">
+                {Math.round(percent)}%
               </span>
               <span className="col-start-2 row-start-2 truncate text-[9px] leading-none text-muted-foreground/70 tabular-nums">
-                {window.unlimited
-                  ? "No limit"
-                  : countdown === "now"
-                    ? "Reset due"
-                    : countdown
-                      ? `Resets in ${countdown}`
-                      : "Reset time unavailable"}
+                {countdown === "now"
+                  ? "Reset due"
+                  : countdown
+                    ? `Resets in ${countdown}`
+                    : "Reset time unavailable"}
               </span>
             </TooltipTrigger>
             <TooltipPopup>
-              {providerLabel} {label}:{" "}
-              {window.unlimited ? "Unlimited" : `${Math.round(percent)}% used`}
-              {!window.unlimited && reset ? ` · Resets ${reset}` : null}
+              {providerLabel} {label}: {Math.round(percent)}% used
+              {reset ? ` · Resets ${reset}` : null}
             </TooltipPopup>
           </Tooltip>
         );

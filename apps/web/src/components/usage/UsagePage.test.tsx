@@ -246,12 +246,11 @@ describe("UsagePage subscription limits", () => {
             observedAt: "2026-08-26T20:00:00.000Z",
             stale: true,
             windows: [
-              { kind: "fiveHour", usedPercent: 0, resetsAt: null, unlimited: true },
+              { kind: "fiveHour", usedPercent: 0, resetsAt: null },
               {
                 kind: "weekly",
                 usedPercent: 8,
                 resetsAt: "2030-08-29T21:00:00.000Z",
-                unlimited: false,
               },
             ],
           },
@@ -267,9 +266,7 @@ describe("UsagePage subscription limits", () => {
 
     expect(markup).toContain('aria-label="Codex 5h limit"');
     expect(markup).toContain('aria-label="Codex Week limit"');
-    expect(markup).toContain('aria-valuetext="Unlimited. No limit on this plan."');
-    expect(markup).toContain("∞");
-    expect(markup).toContain("No limit");
+    expect(markup).toContain('aria-valuetext="0% used."');
     expect(markup).toContain("Resets in");
     expect(markup).toContain("Limits last updated");
     expect(markup).toContain("Aug 29, 9:00 PM");

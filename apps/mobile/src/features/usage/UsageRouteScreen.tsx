@@ -419,40 +419,31 @@ function UsageLimitMeters(props: {
               <View
                 accessibilityRole="progressbar"
                 accessibilityLabel={`${PROVIDER_LABEL[props.limits.provider]} ${label} limit`}
-                accessibilityHint={
-                  window.unlimited ? "No limit on this plan" : reset ? `Resets ${reset}` : undefined
-                }
-                accessibilityValue={
-                  window.unlimited
-                    ? { text: "Unlimited" }
-                    : { min: 0, max: 100, now: Math.round(percent) }
-                }
+                accessibilityHint={reset ? `Resets ${reset}` : undefined}
+                accessibilityValue={{ min: 0, max: 100, now: Math.round(percent) }}
                 className="h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-subtle"
               >
                 <View
                   className="h-full rounded-full"
                   style={{
-                    width: window.unlimited ? "100%" : `${percent}%`,
+                    width: `${percent}%`,
                     backgroundColor: props.color,
-                    opacity: window.unlimited ? 0.45 : 1,
                   }}
                 />
               </View>
               <Text className="w-9 text-right text-xs tabular-nums text-foreground-muted">
-                {window.unlimited ? "∞" : `${Math.round(percent)}%`}
+                {Math.round(percent)}%
               </Text>
             </View>
             <Text
               numberOfLines={1}
               className="mx-11 text-[11px] tabular-nums text-foreground-tertiary"
             >
-              {window.unlimited
-                ? "No limit"
-                : countdown === "now"
-                  ? "Reset due"
-                  : countdown
-                    ? `Resets in ${countdown}`
-                    : "Reset time unavailable"}
+              {countdown === "now"
+                ? "Reset due"
+                : countdown
+                  ? `Resets in ${countdown}`
+                  : "Reset time unavailable"}
             </Text>
           </View>
         );

@@ -181,8 +181,6 @@ export const UsageLimitWindow = Schema.Struct({
   label: Schema.optionalKey(TrimmedNonEmptyString),
   usedPercent: Schema.Number,
   resetsAt: Schema.NullOr(Schema.String),
-  /** True when this plan has no cap for the window. */
-  unlimited: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 });
 export type UsageLimitWindow = typeof UsageLimitWindow.Type;
 

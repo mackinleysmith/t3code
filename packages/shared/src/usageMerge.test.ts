@@ -318,7 +318,7 @@ describe("mergeUsage", () => {
             {
               provider: "codex",
               plan: "plus",
-              windows: [{ kind: "fiveHour", usedPercent: 20, resetsAt: null, unlimited: false }],
+              windows: [{ kind: "fiveHour", usedPercent: 20, resetsAt: null }],
             },
           ],
         }),
@@ -329,7 +329,7 @@ describe("mergeUsage", () => {
             {
               provider: "codex",
               plan: "pro",
-              windows: [{ kind: "fiveHour", usedPercent: 35, resetsAt: null, unlimited: false }],
+              windows: [{ kind: "fiveHour", usedPercent: 35, resetsAt: null }],
             },
           ],
         }),
@@ -341,7 +341,7 @@ describe("mergeUsage", () => {
       {
         provider: "codex",
         plan: "pro",
-        windows: [{ kind: "fiveHour", usedPercent: 35, resetsAt: null, unlimited: false }],
+        windows: [{ kind: "fiveHour", usedPercent: 35, resetsAt: null }],
       },
     ]);
   });

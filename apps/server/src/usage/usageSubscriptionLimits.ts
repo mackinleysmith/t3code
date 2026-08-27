@@ -240,7 +240,6 @@ function claudeWindow(
     label,
     usedPercent: percent,
     resetsAt: window?.resets_at ?? null,
-    unlimited: false,
   };
 }
 
@@ -285,7 +284,6 @@ function readClaudeScopedWindows(value: unknown): readonly UsageLimitWindow[] {
         label: normalizedLabel,
         usedPercent: percent,
         resetsAt,
-        unlimited: false,
       },
     ];
   });
@@ -385,7 +383,6 @@ function codexWindow(
     label: presentation.label,
     usedPercent: percent,
     resetsAt,
-    unlimited: false,
   };
 }
 
