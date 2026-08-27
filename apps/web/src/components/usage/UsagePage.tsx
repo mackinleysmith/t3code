@@ -496,8 +496,15 @@ function ProviderMark({
   readonly provider: UsageProviderKind;
   readonly className: string;
 }) {
-  const Mark = PROVIDER_PRESENTATION[provider].mark;
-  return <Mark className={cn("shrink-0", className)} aria-hidden />;
+  const presentation = PROVIDER_PRESENTATION[provider];
+  const Mark = presentation.mark;
+  return (
+    <Mark
+      className={cn("shrink-0", className)}
+      style={{ color: presentation.color, fill: presentation.color }}
+      aria-hidden
+    />
+  );
 }
 
 function usageLimitWindowLabel(window: UsageLimitWindow): string {

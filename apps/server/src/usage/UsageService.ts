@@ -168,7 +168,7 @@ export const make = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
       const fixture = makeSubscriptionLimitsDevFixture(
         config.devUrl !== undefined,
-        process.env.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
+        hostEnvironment.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
         now,
       );
       if (fixture !== null) return fixture;
@@ -214,7 +214,7 @@ export const make = Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis;
     const fixture = makeSubscriptionLimitsDevFixture(
       config.devUrl !== undefined,
-      process.env.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
+      hostEnvironment.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
       now,
     );
     if (fixture !== null) return;
@@ -272,7 +272,11 @@ export const make = Effect.gen(function* () {
           [
             settings.providers.claudeAgent.enabled && cachedClaude === undefined
               ? runSubscriptionLimitsProbe(
-                  probeClaudeUsage(settings.providers.claudeAgent, process.env, config.cwd).pipe(
+                  probeClaudeUsage(
+                    settings.providers.claudeAgent,
+                    hostEnvironment,
+                    config.cwd,
+                  ).pipe(
                     Effect.provideService(FileSystem.FileSystem, fileSystem),
                     Effect.provideService(Path.Path, path),
                   ),
@@ -281,7 +285,7 @@ export const make = Effect.gen(function* () {
               : Effect.void,
             settings.providers.codex.enabled && cachedCodex === undefined
               ? runSubscriptionLimitsProbe(
-                  probeCodexRateLimits(codexProbeSettings, process.env, config.cwd).pipe(
+                  probeCodexRateLimits(codexProbeSettings, hostEnvironment, config.cwd).pipe(
                     Effect.provideService(
                       ChildProcessSpawner.ChildProcessSpawner,
                       childProcessSpawner,

@@ -74,6 +74,7 @@ vi.mock("./usageProviders", async (importOriginal) => {
 });
 
 import { UsagePage } from "./UsagePage";
+import { PROVIDER_ORDER } from "./usageProviders";
 
 const providerTotals = (codex: number, claude: number) =>
   new Map([
@@ -187,6 +188,42 @@ describe("UsagePage model breakdown", () => {
 });
 
 describe("UsagePage subscription limits", () => {
+  it("keeps provider marks keyed to their chart colors without quota meters", () => {
+    const current = testState.useUsage();
+    testState.useUsage.mockReturnValue({
+      ...current,
+      merged: {
+        ...current.merged,
+        providers: [
+          {
+            provider: "codex",
+            costUsd: 12,
+            totalTokens: 2_000,
+            records: 2,
+            sessions: 1,
+            costShare: 0.6,
+            tokenShare: 0.6,
+          },
+          {
+            provider: "claude",
+            costUsd: 8,
+            totalTokens: 1_000,
+            records: 1,
+            sessions: 1,
+            costShare: 0.4,
+            tokenShare: 0.4,
+          },
+        ],
+      },
+    });
+
+    const markup = renderToStaticMarkup(<UsagePage />);
+
+    expect(markup).toContain('style="color:white;fill:white"');
+    expect(markup).toContain('style="color:orange;fill:orange"');
+    expect(markup).not.toContain('role="progressbar"');
+  });
+
   it("keeps provider share copy and adds compact quota meters", () => {
     testState.useUsage.mockReturnValue({
       merged: {
@@ -246,7 +283,7 @@ describe("UsagePage subscription limits", () => {
 
     const markup = renderToStaticMarkup(<UsagePage />);
 
-    expect(markup.match(/grid-rows-\[auto_auto\]/g)).toHaveLength(4);
+    expect(markup.match(/grid-rows-\[auto_auto\]/g)).toHaveLength(PROVIDER_ORDER.length * 2);
     expect(markup).toContain("min-h-60 flex-1");
     expect(markup).not.toContain("size-2 shrink-0 rounded-full bg-muted");
   });

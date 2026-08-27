@@ -400,9 +400,10 @@ export function normalizeCodexSubscriptionLimits(
   ].filter((window): window is UsageLimitWindow => window !== null);
   if (meteredWindows.length === 0) return null;
 
+  const plan = response.rateLimits.planType?.trim() ?? "";
   return {
     provider: "codex",
-    plan: response.rateLimits.planType ?? null,
+    plan: plan.length > 0 ? plan : null,
     windows: meteredWindows,
   };
 }

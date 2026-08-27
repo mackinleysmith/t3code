@@ -169,6 +169,17 @@ describe("subscription usage limits", () => {
     ]);
   });
 
+  it("normalizes blank Codex plan names to null", () => {
+    expect(
+      normalizeCodexSubscriptionLimits({
+        rateLimits: {
+          planType: "   ",
+          primary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: null },
+        },
+      })?.plan,
+    ).toBeNull();
+  });
+
   it("classifies Codex windows within the upstream five-percent tolerance", () => {
     const limits = normalizeCodexSubscriptionLimits({
       rateLimits: {
