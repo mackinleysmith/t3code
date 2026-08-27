@@ -159,119 +159,139 @@ export const make = Effect.gen(function* () {
   let ratesStatus: UsageSummary["pricing"]["status"] = "unavailable";
   const subscriptionLimitsCache = new Map<UsageProviderKind, SubscriptionLimitsCacheEntry>();
 
-  const readSubscriptionLimits = Effect.fn("UsageService.readSubscriptionLimits")(
-    (codexSnapshot: CodexTranscriptRateLimitsSnapshot | null) =>
-      subscriptionLimitsSemaphore.withPermits(1)(
-        Effect.gen(function* () {
-          const now = yield* Clock.currentTimeMillis;
-          const fixture = makeSubscriptionLimitsDevFixture(
-            config.devUrl !== undefined,
-            process.env.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
-            now,
-          );
-          if (fixture !== null) return fixture;
+  const readCurrentSubscriptionLimits = Effect.fn("UsageService.readCurrentSubscriptionLimits")(
+    function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const fixture = makeSubscriptionLimitsDevFixture(
+        config.devUrl !== undefined,
+        process.env.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
+        now,
+      );
+      if (fixture !== null) return fixture;
 
-          const cachedOutcomes = new Map<UsageProviderKind, SubscriptionLimitsProbeOutcome>();
-          for (const [provider, cached] of subscriptionLimitsCache) {
-            const outcome = readSubscriptionLimitsCacheEntry(cached, now);
-            if (outcome !== undefined) cachedOutcomes.set(provider, outcome);
-          }
+      const settings = yield* settingsService.getSettings.pipe(
+        Effect.catchCause(() => Effect.succeed(null)),
+      );
+      const providers: readonly UsageProviderKind[] =
+        settings === null
+          ? ["codex", "claude"]
+          : [
+              ...(settings.providers.codex.enabled ? (["codex"] as const) : []),
+              ...(settings.providers.claudeAgent.enabled ? (["claude"] as const) : []),
+            ];
 
-          const settings = yield* settingsService.getSettings.pipe(
-            Effect.catchCause(() => Effect.succeed(null)),
-          );
-          if (settings === null) {
-            return [...cachedOutcomes.values()].flatMap((outcome) =>
-              outcome._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [],
-            );
-          }
-
-          const cachedClaude = settings.providers.claudeAgent.enabled
-            ? cachedOutcomes.get("claude")
-            : undefined;
-          const cachedCodex = settings.providers.codex.enabled
-            ? cachedOutcomes.get("codex")
-            : undefined;
-          const codexHomeLayout = yield* resolveCodexHomeLayout(settings.providers.codex).pipe(
-            Effect.provideService(Path.Path, path),
-          );
-          const codexProbeSettings = {
-            ...settings.providers.codex,
-            homePath: codexHomeLayout.effectiveHomePath ?? "",
-          };
-          const codexSnapshotOutcome =
-            settings.providers.codex.enabled && cachedCodex === undefined && codexSnapshot !== null
-              ? Option.some({
-                  outcome: {
-                    _tag: "Success",
-                    limits: normalizeCodexSubscriptionLimits(codexSnapshot.response),
-                  } satisfies SubscriptionLimitsProbeOutcome,
-                  observedAtMs: codexSnapshot.observedAtMs,
-                })
-              : Option.none();
-
-          const [claudeProbeOutcome, codexProbeOutcome] = yield* Effect.all(
-            [
-              settings.providers.claudeAgent.enabled && cachedClaude === undefined
-                ? runSubscriptionLimitsProbe(
-                    probeClaudeUsage(settings.providers.claudeAgent, process.env, config.cwd).pipe(
-                      Effect.provideService(FileSystem.FileSystem, fileSystem),
-                      Effect.provideService(Path.Path, path),
-                    ),
-                    normalizeClaudeSubscriptionLimits,
-                  ).pipe(Effect.map(Option.some))
-                : Effect.succeed(Option.none()),
-              settings.providers.codex.enabled &&
-              cachedCodex === undefined &&
-              Option.isNone(codexSnapshotOutcome)
-                ? runSubscriptionLimitsProbe(
-                    probeCodexRateLimits(codexProbeSettings, process.env, config.cwd).pipe(
-                      Effect.provideService(
-                        ChildProcessSpawner.ChildProcessSpawner,
-                        childProcessSpawner,
-                      ),
-                    ),
-                    normalizeCodexSubscriptionLimits,
-                  ).pipe(Effect.map(Option.some))
-                : Effect.succeed(Option.none()),
-            ],
-            { concurrency: "unbounded" },
-          );
-
-          const fetchedAtMs = yield* Clock.currentTimeMillis;
-          let claudeOutcome = cachedClaude;
-          if (Option.isSome(claudeProbeOutcome)) {
-            const entry = makeSubscriptionLimitsCacheEntry(
-              claudeProbeOutcome.value,
-              fetchedAtMs,
-              subscriptionLimitsCache.get("claude"),
-            );
-            subscriptionLimitsCache.set("claude", entry);
-            claudeOutcome = readSubscriptionLimitsCacheEntry(entry, fetchedAtMs);
-          }
-          let codexOutcome = cachedCodex;
-          const freshCodexOutcome = Option.isSome(codexSnapshotOutcome)
-            ? codexSnapshotOutcome.value
-            : Option.isSome(codexProbeOutcome)
-              ? { outcome: codexProbeOutcome.value, observedAtMs: fetchedAtMs }
-              : undefined;
-          if (freshCodexOutcome !== undefined) {
-            const entry = makeSubscriptionLimitsCacheEntry(
-              freshCodexOutcome.outcome,
-              fetchedAtMs,
-              subscriptionLimitsCache.get("codex"),
-              freshCodexOutcome.observedAtMs,
-            );
-            subscriptionLimitsCache.set("codex", entry);
-            codexOutcome = readSubscriptionLimitsCacheEntry(entry, fetchedAtMs);
-          }
-
-          return [codexOutcome, claudeOutcome].flatMap((outcome) =>
-            outcome?._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [],
-          );
-        }),
-      ),
+      return providers.flatMap((provider) => {
+        const outcome = readSubscriptionLimitsCacheEntry(
+          subscriptionLimitsCache.get(provider),
+          now,
+        );
+        return outcome?._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [];
+      });
+    },
   );
+
+  const cacheSubscriptionLimitsProbe = Effect.fn("UsageService.cacheSubscriptionLimitsProbe")(
+    function* (provider: UsageProviderKind, outcome: SubscriptionLimitsProbeOutcome) {
+      const fetchedAtMs = yield* Clock.currentTimeMillis;
+      subscriptionLimitsCache.set(
+        provider,
+        makeSubscriptionLimitsCacheEntry(
+          outcome,
+          fetchedAtMs,
+          subscriptionLimitsCache.get(provider),
+        ),
+      );
+    },
+  );
+
+  const refreshSubscriptionLimits = Effect.fn("UsageService.refreshSubscriptionLimits")(function* (
+    codexSnapshot: CodexTranscriptRateLimitsSnapshot | null,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    const fixture = makeSubscriptionLimitsDevFixture(
+      config.devUrl !== undefined,
+      process.env.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
+      now,
+    );
+    if (fixture !== null) return;
+
+    // The transcript value is already available and account-accurate. Cache
+    // it before taking the probe lock so a slow Claude refresh cannot hold it
+    // past the page response budget or its own freshness deadline.
+    if (
+      codexSnapshot !== null &&
+      readSubscriptionLimitsCacheEntry(subscriptionLimitsCache.get("codex"), now) === undefined
+    ) {
+      subscriptionLimitsCache.set(
+        "codex",
+        makeSubscriptionLimitsCacheEntry(
+          {
+            _tag: "Success",
+            limits: normalizeCodexSubscriptionLimits(codexSnapshot.response),
+          },
+          now,
+          subscriptionLimitsCache.get("codex"),
+          codexSnapshot.observedAtMs,
+        ),
+      );
+    }
+
+    yield* subscriptionLimitsSemaphore.withPermits(1)(
+      Effect.gen(function* () {
+        const probeStartedAtMs = yield* Clock.currentTimeMillis;
+
+        const cachedOutcomes = new Map<UsageProviderKind, SubscriptionLimitsProbeOutcome>();
+        for (const [provider, cached] of subscriptionLimitsCache) {
+          const outcome = readSubscriptionLimitsCacheEntry(cached, probeStartedAtMs);
+          if (outcome !== undefined) cachedOutcomes.set(provider, outcome);
+        }
+
+        const settings = yield* settingsService.getSettings.pipe(
+          Effect.catchCause(() => Effect.succeed(null)),
+        );
+        if (settings === null) return;
+
+        const cachedClaude = settings.providers.claudeAgent.enabled
+          ? cachedOutcomes.get("claude")
+          : undefined;
+        const cachedCodex = settings.providers.codex.enabled
+          ? cachedOutcomes.get("codex")
+          : undefined;
+        const codexHomeLayout = yield* resolveCodexHomeLayout(settings.providers.codex).pipe(
+          Effect.provideService(Path.Path, path),
+        );
+        const codexProbeSettings = {
+          ...settings.providers.codex,
+          homePath: codexHomeLayout.effectiveHomePath ?? "",
+        };
+        yield* Effect.all(
+          [
+            settings.providers.claudeAgent.enabled && cachedClaude === undefined
+              ? runSubscriptionLimitsProbe(
+                  probeClaudeUsage(settings.providers.claudeAgent, process.env, config.cwd).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    Effect.provideService(Path.Path, path),
+                  ),
+                  normalizeClaudeSubscriptionLimits,
+                ).pipe(Effect.flatMap((outcome) => cacheSubscriptionLimitsProbe("claude", outcome)))
+              : Effect.void,
+            settings.providers.codex.enabled && cachedCodex === undefined
+              ? runSubscriptionLimitsProbe(
+                  probeCodexRateLimits(codexProbeSettings, process.env, config.cwd).pipe(
+                    Effect.provideService(
+                      ChildProcessSpawner.ChildProcessSpawner,
+                      childProcessSpawner,
+                    ),
+                  ),
+                  normalizeCodexSubscriptionLimits,
+                ).pipe(Effect.flatMap((outcome) => cacheSubscriptionLimitsProbe("codex", outcome)))
+              : Effect.void,
+          ],
+          { concurrency: "unbounded" },
+        );
+      }),
+    );
+  });
 
   /**
    * Loads the LiteLLM rate table, preferring a fresh copy and falling back to
@@ -494,10 +514,10 @@ export const make = Effect.gen(function* () {
             startedAtMs,
           ),
         );
-    const subscriptionLimitsFiber = yield* readSubscriptionLimits(codexSnapshot).pipe(
+    const subscriptionLimitsFiber = yield* refreshSubscriptionLimits(codexSnapshot).pipe(
       // Subscription meters are optional. Provider payload drift must not make
       // transcript usage unavailable.
-      Effect.catchCause(() => Effect.succeed([])),
+      Effect.catchCause(() => Effect.void),
       Effect.forkIn(subscriptionLimitsScope),
     );
     yield* ensureRates();
@@ -587,7 +607,10 @@ export const make = Effect.gen(function* () {
     const aggregated = aggregator.finish();
     const readAt = yield* DateTime.now;
     const finishedAtMs = yield* Clock.currentTimeMillis;
-    const subscriptionLimits = yield* awaitSubscriptionLimits(subscriptionLimitsFiber);
+    const subscriptionLimits = yield* awaitSubscriptionLimits(
+      subscriptionLimitsFiber,
+      readCurrentSubscriptionLimits(),
+    );
 
     return {
       contractVersion: USAGE_CONTRACT_VERSION,

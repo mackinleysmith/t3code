@@ -275,7 +275,7 @@ describe("subscription usage limits", () => {
     expect(limits?.windows.map((window) => window.usedPercent)).toEqual([100, 0]);
   });
 
-  it.effect("returns after five seconds while a slow provider probe keeps running", () =>
+  it.effect("returns ready limits without waiting for a slow provider refresh", () =>
     Effect.gen(function* () {
       const limits = {
         provider: "codex",
@@ -289,19 +289,58 @@ describe("subscription usage limits", () => {
           },
         ],
       } satisfies UsageProviderLimits;
-      const providerFiber = yield* Effect.sleep(Duration.seconds(10)).pipe(
-        Effect.as([limits] as readonly UsageProviderLimits[]),
-        Effect.forkScoped,
+      const providerFiber = yield* Effect.sleep(Duration.seconds(10)).pipe(Effect.forkScoped);
+      const result = yield* awaitSubscriptionLimits(providerFiber, Effect.succeed([limits]));
+
+      expect(result).toEqual([limits]);
+      expect(providerFiber.pollUnsafe()).toBeUndefined();
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("returns after five seconds while a slow provider refresh keeps running", () =>
+    Effect.gen(function* () {
+      const providerFiber = yield* Effect.sleep(Duration.seconds(10)).pipe(Effect.forkScoped);
+      const waitFiber = yield* awaitSubscriptionLimits(providerFiber, Effect.succeed([])).pipe(
+        Effect.forkChild,
       );
-      const waitFiber = yield* awaitSubscriptionLimits(providerFiber).pipe(Effect.forkChild);
 
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(5));
-
       expect(yield* Fiber.join(waitFiber)).toEqual([]);
 
       yield* TestClock.adjust(Duration.seconds(5));
-      expect(yield* Fiber.join(providerFiber)).toEqual([limits]);
+      expect(yield* Fiber.join(providerFiber)).toBeUndefined();
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("re-reads limits after the refresh budget", () =>
+    Effect.gen(function* () {
+      let current: readonly UsageProviderLimits[] = [];
+      const limits = {
+        provider: "codex",
+        plan: "plus",
+        windows: [
+          {
+            kind: "weekly",
+            usedPercent: 42,
+            resetsAt: null,
+            unlimited: false,
+          },
+        ],
+      } satisfies UsageProviderLimits;
+      const providerFiber = yield* Effect.sleep(Duration.seconds(3)).pipe(
+        Effect.tap(() => Effect.sync(() => (current = [limits]))),
+        Effect.forkScoped,
+      );
+      const waitFiber = yield* awaitSubscriptionLimits(
+        providerFiber,
+        Effect.sync(() => current),
+      ).pipe(Effect.forkChild);
+
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.seconds(3));
+
+      expect(yield* Fiber.join(waitFiber)).toEqual([limits]);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 

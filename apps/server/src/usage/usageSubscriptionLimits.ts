@@ -56,19 +56,20 @@ export const runSubscriptionLimitsProbe = Effect.fn("runSubscriptionLimitsProbe"
     ),
 );
 
-/** Bounds the page response without interrupting the service-owned probe fiber. */
-export const awaitSubscriptionLimits = Effect.fn("awaitSubscriptionLimits")(
-  (fiber: Fiber.Fiber<readonly UsageProviderLimits[], never>) =>
-    Fiber.join(fiber).pipe(
-      Effect.timeoutOption(SUBSCRIPTION_LIMITS_READ_BUDGET_MS),
-      Effect.map(
-        Option.match({
-          onNone: (): readonly UsageProviderLimits[] => [],
-          onSome: (limits) => limits,
-        }),
-      ),
-    ),
-);
+/** Returns ready limits immediately, otherwise gives the background refresh a short budget. */
+export const awaitSubscriptionLimits = Effect.fn("awaitSubscriptionLimits")(function* (
+  refreshFiber: Fiber.Fiber<void, never>,
+  readCurrent: Effect.Effect<readonly UsageProviderLimits[], never>,
+) {
+  const ready = yield* readCurrent;
+  if (ready.length > 0) return ready;
+
+  yield* Fiber.join(refreshFiber).pipe(
+    Effect.timeoutOption(SUBSCRIPTION_LIMITS_READ_BUDGET_MS),
+    Effect.asVoid,
+  );
+  return yield* readCurrent;
+});
 
 export function makeSubscriptionLimitsCacheEntry(
   outcome: SubscriptionLimitsProbeOutcome,
