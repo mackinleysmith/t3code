@@ -14,6 +14,7 @@ import {
   parseCodexTranscriptRateLimitsSnapshot,
   readSubscriptionLimitsCacheEntry,
   runSubscriptionLimitsProbe,
+  shouldReadCodexTranscriptSnapshot,
 } from "./usageSubscriptionLimits.ts";
 
 describe("subscription usage limits", () => {
@@ -386,6 +387,21 @@ describe("subscription usage limits", () => {
 
     expect(readSubscriptionLimitsCacheEntry(entry, 600_999)).toEqual({ _tag: "Failure" });
     expect(readSubscriptionLimitsCacheEntry(entry, 601_000)).toBeUndefined();
+  });
+
+  it("checks Codex transcripts during probe backoff", () => {
+    const success = makeSubscriptionLimitsCacheEntry({ _tag: "Success", limits: null }, 1_000);
+    const failure = makeSubscriptionLimitsCacheEntry({ _tag: "Failure" }, 1_000);
+    const failureWithLastKnownGood = makeSubscriptionLimitsCacheEntry(
+      { _tag: "Failure" },
+      181_000,
+      success,
+    );
+
+    expect(shouldReadCodexTranscriptSnapshot(success, 1_001)).toBe(false);
+    expect(shouldReadCodexTranscriptSnapshot(success, 181_000)).toBe(true);
+    expect(shouldReadCodexTranscriptSnapshot(failure, 1_001)).toBe(true);
+    expect(shouldReadCodexTranscriptSnapshot(failureWithLastKnownGood, 181_001)).toBe(true);
   });
 
   it("retains the last known good limits when a refresh fails", () => {

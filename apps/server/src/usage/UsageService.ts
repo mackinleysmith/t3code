@@ -67,6 +67,7 @@ import {
   normalizeCodexSubscriptionLimits,
   readSubscriptionLimitsCacheEntry,
   runSubscriptionLimitsProbe,
+  shouldReadCodexTranscriptSnapshot,
   SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
   type CodexTranscriptRateLimitsSnapshot,
   type SubscriptionLimitsCacheEntry,
@@ -220,7 +221,7 @@ export const make = Effect.gen(function* () {
     // past the page response budget or its own freshness deadline.
     if (
       codexSnapshot !== null &&
-      readSubscriptionLimitsCacheEntry(subscriptionLimitsCache.get("codex"), now) === undefined
+      shouldReadCodexTranscriptSnapshot(subscriptionLimitsCache.get("codex"), now)
     ) {
       subscriptionLimitsCache.set(
         "codex",
@@ -502,18 +503,18 @@ export const make = Effect.gen(function* () {
         ? []
         : yield* Effect.promise(() => listTranscriptFiles(codexDir, windowStartMs));
     if (codexDir !== undefined) prefetchedFiles.set(codexDir, codexFiles);
-    const codexLimitsCacheActive =
-      readSubscriptionLimitsCacheEntry(subscriptionLimitsCache.get("codex"), startedAtMs) !==
-      undefined;
-    const codexSnapshot = codexLimitsCacheActive
-      ? null
-      : yield* Effect.promise(() =>
+    const codexSnapshot = shouldReadCodexTranscriptSnapshot(
+      subscriptionLimitsCache.get("codex"),
+      startedAtMs,
+    )
+      ? yield* Effect.promise(() =>
           readFreshCodexRateLimitsSnapshot(
             codexFiles,
             startedAtMs - SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
             startedAtMs,
           ),
-        );
+        )
+      : null;
     const subscriptionLimitsFiber = yield* refreshSubscriptionLimits(codexSnapshot).pipe(
       // Subscription meters are optional. Provider payload drift must not make
       // transcript usage unavailable.

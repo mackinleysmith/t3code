@@ -110,6 +110,17 @@ export function readSubscriptionLimitsCacheEntry(
   };
 }
 
+/** Probe failures back off subprocesses but must not suppress free local recovery. */
+export function shouldReadCodexTranscriptSnapshot(
+  entry: SubscriptionLimitsCacheEntry | undefined,
+  nowMs: number,
+): boolean {
+  return (
+    entry?.outcome._tag === "Failure" ||
+    readSubscriptionLimitsCacheEntry(entry, nowMs) === undefined
+  );
+}
+
 function stampSubscriptionLimits(
   limits: UsageProviderLimits | null,
   observedAtMs: number | undefined,
