@@ -413,16 +413,14 @@ function UsageLimitMeters(props: {
         return (
           <View key={`${window.kind}:${label}`} className="gap-1">
             <View className="flex-row items-center gap-2">
-              <Text className="w-9 text-xs text-foreground-muted">{label}</Text>
+              <Text numberOfLines={1} className="w-9 text-xs text-foreground-muted">
+                {label}
+              </Text>
               <View
                 accessibilityRole="progressbar"
                 accessibilityLabel={`${PROVIDER_LABEL[props.limits.provider]} ${label} limit`}
                 accessibilityHint={
-                  window.unlimited
-                    ? "No five-hour limit on this plan"
-                    : reset
-                      ? `Resets ${reset}`
-                      : undefined
+                  window.unlimited ? "No limit on this plan" : reset ? `Resets ${reset}` : undefined
                 }
                 accessibilityValue={
                   window.unlimited

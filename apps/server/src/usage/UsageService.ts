@@ -491,6 +491,7 @@ export const make = Effect.gen(function* () {
       readFreshCodexRateLimitsSnapshot(
         codexFiles,
         startedAtMs - SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
+        startedAtMs,
       ),
     );
     const subscriptionLimitsFiber = yield* readSubscriptionLimits(codexSnapshot).pipe(

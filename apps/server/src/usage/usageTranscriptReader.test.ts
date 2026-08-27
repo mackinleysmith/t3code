@@ -35,9 +35,10 @@ describe("Codex transcript rate-limit snapshots", () => {
       const path = NodePath.join(directory, "rollout.jsonl");
       const olderAt = "2026-08-27T02:09:00.000Z";
       const newerAt = "2026-08-27T02:10:00.000Z";
+      const futureAt = "2036-08-27T02:10:00.000Z";
       await NodeFSP.writeFile(
         path,
-        `${rateLimitLine(olderAt, 40)}\n${rateLimitLine(newerAt, 57)}\n`,
+        `${rateLimitLine(olderAt, 40)}\n${rateLimitLine(newerAt, 57)}\n${rateLimitLine(futureAt, 99)}\n`,
       );
       const stats = await NodeFSP.stat(path);
       const files = [{ path, size: stats.size, mtimeMs: stats.mtimeMs }];
@@ -45,11 +46,16 @@ describe("Codex transcript rate-limit snapshots", () => {
       const snapshot = await readFreshCodexRateLimitsSnapshot(
         files,
         Date.parse("2026-08-27T02:08:00.000Z"),
+        Date.parse("2026-08-27T02:10:30.000Z"),
       );
       expect(snapshot?.observedAtMs).toBe(Date.parse(newerAt));
       expect(snapshot?.response.rateLimits.secondary?.usedPercent).toBe(57);
       await expect(
-        readFreshCodexRateLimitsSnapshot(files, Date.parse("2026-08-27T02:11:00.000Z")),
+        readFreshCodexRateLimitsSnapshot(
+          files,
+          Date.parse("2026-08-27T02:11:00.000Z"),
+          Date.parse("2026-08-27T02:11:30.000Z"),
+        ),
       ).resolves.toBeNull();
     } finally {
       await NodeFSP.rm(directory, { recursive: true, force: true });

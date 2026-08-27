@@ -30,6 +30,7 @@ import {
 } from "./usageTranscripts.ts";
 
 const CODEX_RATE_LIMIT_TAIL_BYTES = 1024 * 1024;
+const CODEX_RATE_LIMIT_CLOCK_SKEW_MS = 60_000;
 
 export interface TranscriptFile {
   readonly path: string;
@@ -104,7 +105,9 @@ export async function readDirectoryVolumeId(path: string): Promise<string> {
 export async function readFreshCodexRateLimitsSnapshot(
   files: readonly TranscriptFile[],
   sinceMs: number,
+  nowMs: number,
 ): Promise<CodexTranscriptRateLimitsSnapshot | null> {
+  const latestAllowedMs = nowMs + CODEX_RATE_LIMIT_CLOCK_SKEW_MS;
   const candidates = files
     .filter((file) => file.mtimeMs >= sinceMs)
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
@@ -126,7 +129,13 @@ export async function readFreshCodexRateLimitsSnapshot(
         const line = lines[index];
         if (line === undefined || !line.includes('"rate_limits"')) continue;
         const snapshot = parseCodexTranscriptRateLimitsSnapshot(line);
-        if (snapshot === null || snapshot.observedAtMs < sinceMs) continue;
+        if (
+          snapshot === null ||
+          snapshot.observedAtMs < sinceMs ||
+          snapshot.observedAtMs > latestAllowedMs
+        ) {
+          continue;
+        }
         if (newest === null || snapshot.observedAtMs > newest.observedAtMs) newest = snapshot;
         break;
       }

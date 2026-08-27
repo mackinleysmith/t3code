@@ -230,6 +230,7 @@ describe("UsagePage subscription limits", () => {
 
     expect(markup).toContain('aria-label="Codex 5h limit"');
     expect(markup).toContain('aria-label="Codex Week limit"');
+    expect(markup).toContain('aria-valuetext="Unlimited. No limit on this plan."');
     expect(markup).toContain("∞");
     expect(markup).toContain("No limit");
     expect(markup).toContain("Resets in");

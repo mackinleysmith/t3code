@@ -537,12 +537,12 @@ function UsageLimitMeters({
         const label = usageLimitWindowLabel(window);
         const resetText = reset ? ` Resets ${reset}.` : "";
         const usageText = window.unlimited
-          ? "Unlimited. No five-hour limit on this plan."
+          ? "Unlimited. No limit on this plan."
           : `${Math.round(percent)}% used.${resetText}`;
         return (
           <Tooltip key={`${window.kind}:${label}`}>
             <TooltipTrigger render={<div className={USAGE_LIMIT_ROW_CLASS_NAME} />}>
-              <span className="col-start-1 row-start-1 text-[10px] leading-none text-muted-foreground">
+              <span className="col-start-1 row-start-1 truncate text-[10px] leading-none text-muted-foreground">
                 {label}
               </span>
               <span
