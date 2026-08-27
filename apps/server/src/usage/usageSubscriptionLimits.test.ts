@@ -10,6 +10,7 @@ import {
   makeSubscriptionLimitsCacheKey,
   makeSubscriptionLimitsCacheEntry,
   makeSubscriptionLimitsDevFixture,
+  makeSubscriptionLimitsHomeIdentity,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
   parseCodexTranscriptRateLimitsSnapshot,
@@ -23,24 +24,58 @@ describe("subscription usage limits", () => {
     const claudeAccount = makeSubscriptionLimitsCacheKey({
       provider: "claude",
       binaryPath: "claude",
-      homePath: "/accounts/claude-a",
+      homeIdentity: "/accounts/claude-a",
     });
     const cache = new Map([[claudeAccount, "account-a"]]);
 
     const otherClaudeAccount = makeSubscriptionLimitsCacheKey({
       provider: "claude",
       binaryPath: "claude",
-      homePath: "/accounts/claude-b",
+      homeIdentity: "/accounts/claude-b",
     });
     expect(cache.get(otherClaudeAccount)).toBeUndefined();
     expect(
       makeSubscriptionLimitsCacheKey({
         provider: "codex",
         binaryPath: "codex",
-        homePath: "/accounts/claude-a",
+        homeIdentity: "/accounts/claude-a",
         launchArgs: "--config profile=work",
       }),
     ).not.toBe(claudeAccount);
+  });
+
+  it("includes inherited provider homes in the cache identity", () => {
+    const inheritedClaude = makeSubscriptionLimitsHomeIdentity({
+      environmentVariable: "CLAUDE_CONFIG_DIR",
+      environmentHomePath: "/accounts/claude-work",
+      defaultHomePath: "/users/test/.claude",
+      cwd: "/workspace",
+    });
+    const defaultClaude = makeSubscriptionLimitsHomeIdentity({
+      environmentVariable: "CLAUDE_CONFIG_DIR",
+      environmentHomePath: undefined,
+      defaultHomePath: "/users/test/.claude",
+      cwd: "/workspace",
+    });
+    const inheritedCodex = makeSubscriptionLimitsHomeIdentity({
+      environmentVariable: "CODEX_HOME",
+      environmentHomePath: ".codex-work",
+      defaultHomePath: "/users/test/.codex",
+      cwd: "/workspace",
+    });
+
+    expect(inheritedClaude).not.toBe(defaultClaude);
+    expect(inheritedCodex).toContain(".codex-work");
+    expect(inheritedCodex).toContain("/workspace");
+    expect(
+      makeSubscriptionLimitsHomeIdentity({
+        configuredHomePath: "/accounts/explicit",
+        environmentVariable: "CODEX_HOME",
+        environmentHomePath: "/accounts/inherited",
+        defaultHomePath: "/users/test/.codex",
+        cwd: "/workspace",
+      }),
+    ).toBe('["configured","/accounts/explicit"]');
   });
 
   it("normalizes Claude's five-hour and weekly windows", () => {

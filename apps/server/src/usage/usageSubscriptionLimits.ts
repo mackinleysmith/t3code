@@ -43,8 +43,35 @@ export interface SubscriptionLimitsCacheEntry {
 export interface SubscriptionLimitsCacheIdentity {
   readonly provider: UsageProviderKind;
   readonly binaryPath: string;
-  readonly homePath: string;
+  readonly homeIdentity: string;
   readonly launchArgs?: string;
+}
+
+interface SubscriptionLimitsHomeIdentityInput {
+  readonly configuredHomePath?: string;
+  readonly environmentVariable: "CLAUDE_CONFIG_DIR" | "CODEX_HOME";
+  readonly environmentHomePath: string | undefined;
+  readonly defaultHomePath: string;
+  readonly cwd: string;
+}
+
+/** Mirrors the home precedence inherited by a provider probe without rewriting its environment. */
+export function makeSubscriptionLimitsHomeIdentity(
+  input: SubscriptionLimitsHomeIdentityInput,
+): string {
+  const configuredHomePath = input.configuredHomePath?.trim() ?? "";
+  if (configuredHomePath.length > 0) {
+    return JSON.stringify(["configured", configuredHomePath]);
+  }
+
+  const environmentHomePath = input.environmentHomePath?.trim() ?? "";
+  if (environmentHomePath.length > 0) {
+    // Relative environment paths are resolved by the child from its cwd. Keep
+    // both values in the identity instead of changing what the probe receives.
+    return JSON.stringify([input.environmentVariable, environmentHomePath, input.cwd]);
+  }
+
+  return JSON.stringify(["default", input.defaultHomePath]);
 }
 
 /** Keeps cached quota data scoped to the provider runtime and account home that produced it. */
@@ -52,7 +79,7 @@ export function makeSubscriptionLimitsCacheKey(identity: SubscriptionLimitsCache
   return JSON.stringify([
     identity.provider,
     identity.binaryPath,
-    identity.homePath,
+    identity.homeIdentity,
     identity.launchArgs ?? null,
   ]);
 }

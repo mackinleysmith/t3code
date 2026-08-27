@@ -68,6 +68,7 @@ import {
   makeSubscriptionLimitsCacheKey,
   makeSubscriptionLimitsCacheEntry,
   makeSubscriptionLimitsDevFixture,
+  makeSubscriptionLimitsHomeIdentity,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
   readSubscriptionLimitsCacheEntry,
@@ -401,6 +402,27 @@ export const make = Effect.gen(function* () {
       ...settings.providers.codex,
       homePath: codexLayout.effectiveHomePath ?? "",
     };
+    const claudeHomeIdentity = makeSubscriptionLimitsHomeIdentity({
+      ...(settings.providers.claudeAgent.homePath.trim().length > 0
+        ? { configuredHomePath: claudeHome }
+        : {}),
+      environmentVariable: "CLAUDE_CONFIG_DIR",
+      environmentHomePath: hostEnvironment.CLAUDE_CONFIG_DIR,
+      defaultHomePath: path.join(NodeOS.homedir(), ".claude"),
+      cwd: config.cwd,
+    });
+    const codexHomeIdentity = makeSubscriptionLimitsHomeIdentity({
+      ...(codexLayout.effectiveHomePath === undefined
+        ? {}
+        : { configuredHomePath: codexLayout.effectiveHomePath }),
+      environmentVariable: "CODEX_HOME",
+      environmentHomePath: hostEnvironment.CODEX_HOME,
+      defaultHomePath: codexLayout.sharedHomePath,
+      cwd: config.cwd,
+    });
+    const codexInheritsHome =
+      codexLayout.effectiveHomePath === undefined &&
+      (hostEnvironment.CODEX_HOME?.trim().length ?? 0) > 0;
 
     return {
       dirs: [
@@ -418,7 +440,7 @@ export const make = Effect.gen(function* () {
           cacheKey: makeSubscriptionLimitsCacheKey({
             provider: "claude",
             binaryPath: settings.providers.claudeAgent.binaryPath,
-            homePath: claudeHome,
+            homeIdentity: claudeHomeIdentity,
           }),
           settings: settings.providers.claudeAgent,
         },
@@ -427,13 +449,14 @@ export const make = Effect.gen(function* () {
           cacheKey: makeSubscriptionLimitsCacheKey({
             provider: "codex",
             binaryPath: settings.providers.codex.binaryPath,
-            homePath: codexLayout.effectiveHomePath ?? codexLayout.sharedHomePath,
+            homeIdentity: codexHomeIdentity,
             launchArgs: settings.providers.codex.launchArgs,
           }),
           settings: codexProbeSettings,
-          // Shadow homes share transcripts while keeping credentials separate,
-          // so a transcript snapshot cannot identify the active account there.
-          canUseTranscriptSnapshot: codexLayout.mode === "direct",
+          // Shadow homes share transcripts while keeping credentials separate.
+          // An inherited CODEX_HOME can also differ from the default transcript
+          // root resolved above, so neither snapshot identifies the probe account.
+          canUseTranscriptSnapshot: codexLayout.mode === "direct" && !codexInheritsHome,
         },
       } satisfies SubscriptionLimitsContext,
     };
