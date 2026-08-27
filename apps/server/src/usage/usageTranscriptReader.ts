@@ -31,6 +31,7 @@ import {
 
 const CODEX_RATE_LIMIT_TAIL_BYTES = 1024 * 1024;
 const CODEX_RATE_LIMIT_CLOCK_SKEW_MS = 60_000;
+const CODEX_RATE_LIMIT_MAX_CANDIDATES = 8;
 
 export interface TranscriptFile {
   readonly path: string;
@@ -110,7 +111,8 @@ export async function readFreshCodexRateLimitsSnapshot(
   const latestAllowedMs = nowMs + CODEX_RATE_LIMIT_CLOCK_SKEW_MS;
   const candidates = files
     .filter((file) => file.mtimeMs >= sinceMs)
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .slice(0, CODEX_RATE_LIMIT_MAX_CANDIDATES);
   let newest: CodexTranscriptRateLimitsSnapshot | null = null;
 
   for (const file of candidates) {

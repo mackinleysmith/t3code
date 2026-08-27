@@ -61,4 +61,33 @@ describe("Codex transcript rate-limit snapshots", () => {
       await NodeFSP.rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("bounds cold-cache tail reads to the newest rollout candidates", async () => {
+    const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-codex-limits-"));
+    try {
+      const files = await Promise.all(
+        Array.from({ length: 9 }, async (_, index) => {
+          const path = NodePath.join(directory, `rollout-${index}.jsonl`);
+          await NodeFSP.writeFile(
+            path,
+            index === 8 ? `${rateLimitLine("2026-08-27T02:10:00.000Z", 99)}\n` : "{}\n",
+          );
+          const mtimeMs = Date.parse(`2026-08-27T02:10:0${8 - index}.000Z`);
+          await NodeFSP.utimes(path, mtimeMs / 1_000, mtimeMs / 1_000);
+          const stats = await NodeFSP.stat(path);
+          return { path, size: stats.size, mtimeMs: stats.mtimeMs };
+        }),
+      );
+
+      await expect(
+        readFreshCodexRateLimitsSnapshot(
+          files,
+          Date.parse("2026-08-27T02:08:00.000Z"),
+          Date.parse("2026-08-27T02:10:30.000Z"),
+        ),
+      ).resolves.toBeNull();
+    } finally {
+      await NodeFSP.rm(directory, { recursive: true, force: true });
+    }
+  });
 });

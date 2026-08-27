@@ -199,13 +199,8 @@ export const make = Effect.gen(function* () {
             ...settings.providers.codex,
             homePath: codexHomeLayout.effectiveHomePath ?? "",
           };
-          const cachedCodexEntry = subscriptionLimitsCache.get("codex");
-          const codexSnapshotCanRefreshCache =
-            cachedCodex === undefined || cachedCodexEntry?.outcome._tag === "Failure";
           const codexSnapshotOutcome =
-            settings.providers.codex.enabled &&
-            codexSnapshotCanRefreshCache &&
-            codexSnapshot !== null
+            settings.providers.codex.enabled && cachedCodex === undefined && codexSnapshot !== null
               ? Option.some({
                   outcome: {
                     _tag: "Success",
@@ -487,13 +482,18 @@ export const make = Effect.gen(function* () {
         ? []
         : yield* Effect.promise(() => listTranscriptFiles(codexDir, windowStartMs));
     if (codexDir !== undefined) prefetchedFiles.set(codexDir, codexFiles);
-    const codexSnapshot = yield* Effect.promise(() =>
-      readFreshCodexRateLimitsSnapshot(
-        codexFiles,
-        startedAtMs - SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
-        startedAtMs,
-      ),
-    );
+    const codexLimitsCacheActive =
+      readSubscriptionLimitsCacheEntry(subscriptionLimitsCache.get("codex"), startedAtMs) !==
+      undefined;
+    const codexSnapshot = codexLimitsCacheActive
+      ? null
+      : yield* Effect.promise(() =>
+          readFreshCodexRateLimitsSnapshot(
+            codexFiles,
+            startedAtMs - SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
+            startedAtMs,
+          ),
+        );
     const subscriptionLimitsFiber = yield* readSubscriptionLimits(codexSnapshot).pipe(
       // Subscription meters are optional. Provider payload drift must not make
       // transcript usage unavailable.
