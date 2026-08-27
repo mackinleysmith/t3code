@@ -15,7 +15,7 @@ const WEEK_MINUTES = 7 * 24 * 60;
 const UNLIMITED_CODEX_FIVE_HOUR_PLANS = new Set(["pro", "prolite"]);
 
 export const SUBSCRIPTION_LIMITS_READ_BUDGET_MS = 5_000;
-export const SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS = 60_000;
+export const SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS = 3 * 60_000;
 export const SUBSCRIPTION_LIMITS_FAILURE_TTL_MS = 5_000;
 
 export type SubscriptionLimitsProbeOutcome =

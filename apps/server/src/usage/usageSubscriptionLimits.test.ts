@@ -163,14 +163,14 @@ describe("subscription usage limits", () => {
     }),
   );
 
-  it("caches a successful empty response for the normal refresh interval", () => {
+  it("caches a successful empty response for three minutes", () => {
     const entry = makeSubscriptionLimitsCacheEntry({ _tag: "Success", limits: null }, 1_000);
 
-    expect(readSubscriptionLimitsCacheEntry(entry, 60_999)).toEqual({
+    expect(readSubscriptionLimitsCacheEntry(entry, 180_999)).toEqual({
       _tag: "Success",
       limits: null,
     });
-    expect(readSubscriptionLimitsCacheEntry(entry, 61_000)).toBeUndefined();
+    expect(readSubscriptionLimitsCacheEntry(entry, 181_000)).toBeUndefined();
   });
 
   it("retries failed probes after a short backoff", () => {
