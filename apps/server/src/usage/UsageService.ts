@@ -15,6 +15,8 @@ import * as NodeOS from "node:os";
 
 import {
   USAGE_CONTRACT_VERSION,
+  type ClaudeSettings,
+  type CodexSettings,
   type UsageProviderKind,
   type UsageSource,
   type UsageSummary,
@@ -63,6 +65,7 @@ import {
 import type { UsageRecord } from "./usageTranscripts.ts";
 import {
   awaitSubscriptionLimits,
+  makeSubscriptionLimitsCacheKey,
   makeSubscriptionLimitsCacheEntry,
   makeSubscriptionLimitsDevFixture,
   normalizeClaudeSubscriptionLimits,
@@ -141,6 +144,20 @@ export const layerTest = Layer.succeed(
   }),
 );
 
+interface SubscriptionLimitsContext {
+  readonly claude: {
+    readonly enabled: boolean;
+    readonly cacheKey: string;
+    readonly settings: ClaudeSettings;
+  };
+  readonly codex: {
+    readonly enabled: boolean;
+    readonly cacheKey: string;
+    readonly settings: CodexSettings;
+    readonly canUseTranscriptSnapshot: boolean;
+  };
+}
+
 export const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -161,10 +178,10 @@ export const make = Effect.gen(function* () {
   let rates: RateTable = new Map();
   let ratesFetchedAtMs: number | null = null;
   let ratesStatus: UsageSummary["pricing"]["status"] = "unavailable";
-  const subscriptionLimitsCache = new Map<UsageProviderKind, SubscriptionLimitsCacheEntry>();
+  const subscriptionLimitsCache = new Map<string, SubscriptionLimitsCacheEntry>();
 
   const readCurrentSubscriptionLimits = Effect.fn("UsageService.readCurrentSubscriptionLimits")(
-    function* () {
+    function* (context: SubscriptionLimitsContext) {
       const now = yield* Clock.currentTimeMillis;
       const fixture = makeSubscriptionLimitsDevFixture(
         config.devUrl !== undefined,
@@ -173,20 +190,11 @@ export const make = Effect.gen(function* () {
       );
       if (fixture !== null) return fixture;
 
-      const settings = yield* settingsService.getSettings.pipe(
-        Effect.catchCause(() => Effect.succeed(null)),
-      );
-      const providers: readonly UsageProviderKind[] =
-        settings === null
-          ? ["codex", "claude"]
-          : [
-              ...(settings.providers.codex.enabled ? (["codex"] as const) : []),
-              ...(settings.providers.claudeAgent.enabled ? (["claude"] as const) : []),
-            ];
+      const providers = [context.codex, context.claude].filter(({ enabled }) => enabled);
 
-      return providers.flatMap((provider) => {
+      return providers.flatMap(({ cacheKey }) => {
         const outcome = readSubscriptionLimitsCacheEntry(
-          subscriptionLimitsCache.get(provider),
+          subscriptionLimitsCache.get(cacheKey),
           now,
         );
         return outcome?._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [];
@@ -195,20 +203,21 @@ export const make = Effect.gen(function* () {
   );
 
   const cacheSubscriptionLimitsProbe = Effect.fn("UsageService.cacheSubscriptionLimitsProbe")(
-    function* (provider: UsageProviderKind, outcome: SubscriptionLimitsProbeOutcome) {
+    function* (cacheKey: string, outcome: SubscriptionLimitsProbeOutcome) {
       const fetchedAtMs = yield* Clock.currentTimeMillis;
       subscriptionLimitsCache.set(
-        provider,
+        cacheKey,
         makeSubscriptionLimitsCacheEntry(
           outcome,
           fetchedAtMs,
-          subscriptionLimitsCache.get(provider),
+          subscriptionLimitsCache.get(cacheKey),
         ),
       );
     },
   );
 
   const refreshSubscriptionLimits = Effect.fn("UsageService.refreshSubscriptionLimits")(function* (
+    context: SubscriptionLimitsContext,
     codexSnapshot: CodexTranscriptRateLimitsSnapshot | null,
   ) {
     const now = yield* Clock.currentTimeMillis;
@@ -223,18 +232,20 @@ export const make = Effect.gen(function* () {
     // it before taking the probe lock so a slow Claude refresh cannot hold it
     // past the page response budget or its own freshness deadline.
     if (
+      context.codex.enabled &&
+      context.codex.canUseTranscriptSnapshot &&
       codexSnapshot !== null &&
-      shouldReadCodexTranscriptSnapshot(subscriptionLimitsCache.get("codex"), now)
+      shouldReadCodexTranscriptSnapshot(subscriptionLimitsCache.get(context.codex.cacheKey), now)
     ) {
       subscriptionLimitsCache.set(
-        "codex",
+        context.codex.cacheKey,
         makeSubscriptionLimitsCacheEntry(
           {
             _tag: "Success",
             limits: normalizeCodexSubscriptionLimits(codexSnapshot.response),
           },
           now,
-          subscriptionLimitsCache.get("codex"),
+          subscriptionLimitsCache.get(context.codex.cacheKey),
           codexSnapshot.observedAtMs,
         ),
       );
@@ -244,55 +255,47 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const probeStartedAtMs = yield* Clock.currentTimeMillis;
 
-        const cachedOutcomes = new Map<UsageProviderKind, SubscriptionLimitsProbeOutcome>();
-        for (const [provider, cached] of subscriptionLimitsCache) {
-          const outcome = readSubscriptionLimitsCacheEntry(cached, probeStartedAtMs);
-          if (outcome !== undefined) cachedOutcomes.set(provider, outcome);
-        }
-
-        const settings = yield* settingsService.getSettings.pipe(
-          Effect.catchCause(() => Effect.succeed(null)),
-        );
-        if (settings === null) return;
-
-        const cachedClaude = settings.providers.claudeAgent.enabled
-          ? cachedOutcomes.get("claude")
+        const cachedClaude = context.claude.enabled
+          ? readSubscriptionLimitsCacheEntry(
+              subscriptionLimitsCache.get(context.claude.cacheKey),
+              probeStartedAtMs,
+            )
           : undefined;
-        const cachedCodex = settings.providers.codex.enabled
-          ? cachedOutcomes.get("codex")
+        const cachedCodex = context.codex.enabled
+          ? readSubscriptionLimitsCacheEntry(
+              subscriptionLimitsCache.get(context.codex.cacheKey),
+              probeStartedAtMs,
+            )
           : undefined;
-        const codexHomeLayout = yield* resolveCodexHomeLayout(settings.providers.codex).pipe(
-          Effect.provideService(Path.Path, path),
-        );
-        const codexProbeSettings = {
-          ...settings.providers.codex,
-          homePath: codexHomeLayout.effectiveHomePath ?? "",
-        };
         yield* Effect.all(
           [
-            settings.providers.claudeAgent.enabled && cachedClaude === undefined
+            context.claude.enabled && cachedClaude === undefined
               ? runSubscriptionLimitsProbe(
-                  probeClaudeUsage(
-                    settings.providers.claudeAgent,
-                    hostEnvironment,
-                    config.cwd,
-                  ).pipe(
+                  probeClaudeUsage(context.claude.settings, hostEnvironment, config.cwd).pipe(
                     Effect.provideService(FileSystem.FileSystem, fileSystem),
                     Effect.provideService(Path.Path, path),
                   ),
                   normalizeClaudeSubscriptionLimits,
-                ).pipe(Effect.flatMap((outcome) => cacheSubscriptionLimitsProbe("claude", outcome)))
+                ).pipe(
+                  Effect.flatMap((outcome) =>
+                    cacheSubscriptionLimitsProbe(context.claude.cacheKey, outcome),
+                  ),
+                )
               : Effect.void,
-            settings.providers.codex.enabled && cachedCodex === undefined
+            context.codex.enabled && cachedCodex === undefined
               ? runSubscriptionLimitsProbe(
-                  probeCodexRateLimits(codexProbeSettings, hostEnvironment, config.cwd).pipe(
+                  probeCodexRateLimits(context.codex.settings, hostEnvironment, config.cwd).pipe(
                     Effect.provideService(
                       ChildProcessSpawner.ChildProcessSpawner,
                       childProcessSpawner,
                     ),
                   ),
                   normalizeCodexSubscriptionLimits,
-                ).pipe(Effect.flatMap((outcome) => cacheSubscriptionLimitsProbe("codex", outcome)))
+                ).pipe(
+                  Effect.flatMap((outcome) =>
+                    cacheSubscriptionLimitsProbe(context.codex.cacheKey, outcome),
+                  ),
+                )
               : Effect.void,
           ],
           { concurrency: "unbounded" },
@@ -394,15 +397,46 @@ export const make = Effect.gen(function* () {
         ? path.resolve(expandHomePath(grokHomeEnv))
         : path.join(NodeOS.homedir(), ".grok");
 
-    return [
-      { provider: "claude" as const, dir: claudeDir },
-      { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
-      {
-        provider: "grok" as const,
-        dir: path.join(grokHome, "sessions"),
-        fileName: "updates.jsonl",
-      },
-    ];
+    const codexProbeSettings = {
+      ...settings.providers.codex,
+      homePath: codexLayout.effectiveHomePath ?? "",
+    };
+
+    return {
+      dirs: [
+        { provider: "claude" as const, dir: claudeDir },
+        { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
+        {
+          provider: "grok" as const,
+          dir: path.join(grokHome, "sessions"),
+          fileName: "updates.jsonl",
+        },
+      ],
+      subscriptionLimits: {
+        claude: {
+          enabled: settings.providers.claudeAgent.enabled,
+          cacheKey: makeSubscriptionLimitsCacheKey({
+            provider: "claude",
+            binaryPath: settings.providers.claudeAgent.binaryPath,
+            homePath: claudeHome,
+          }),
+          settings: settings.providers.claudeAgent,
+        },
+        codex: {
+          enabled: settings.providers.codex.enabled,
+          cacheKey: makeSubscriptionLimitsCacheKey({
+            provider: "codex",
+            binaryPath: settings.providers.codex.binaryPath,
+            homePath: codexLayout.effectiveHomePath ?? codexLayout.sharedHomePath,
+            launchArgs: settings.providers.codex.launchArgs,
+          }),
+          settings: codexProbeSettings,
+          // Shadow homes share transcripts while keeping credentials separate,
+          // so a transcript snapshot cannot identify the active account there.
+          canUseTranscriptSnapshot: codexLayout.mode === "direct",
+        },
+      } satisfies SubscriptionLimitsContext,
+    };
   });
 
   /**
@@ -505,7 +539,10 @@ export const make = Effect.gen(function* () {
     const startedAtMs = yield* Clock.currentTimeMillis;
     // The home resolvers ask for `Path` themselves; satisfy them from the
     // instance we already hold so `readSummary` stays context-free.
-    const dirs = yield* resolveTranscriptDirs().pipe(Effect.provideService(Path.Path, path));
+    const resolvedUsage = yield* resolveTranscriptDirs().pipe(
+      Effect.provideService(Path.Path, path),
+    );
+    const { dirs, subscriptionLimits: subscriptionLimitsContext } = resolvedUsage;
     const windowStart = DateTime.make(`${input.sinceDay}T00:00:00Z`);
     if (Option.isNone(windowStart)) {
       return yield* new UsageReadError({
@@ -522,19 +559,23 @@ export const make = Effect.gen(function* () {
         ? []
         : yield* Effect.promise(() => listTranscriptFiles(codexDir, windowStartMs));
     if (codexDir !== undefined) prefetchedFiles.set(codexDir, codexFiles);
-    const codexSnapshot = shouldReadCodexTranscriptSnapshot(
-      subscriptionLimitsCache.get("codex"),
-      startedAtMs,
-    )
-      ? yield* Effect.promise(() =>
-          readFreshCodexRateLimitsSnapshot(
-            codexFiles,
-            startedAtMs - SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
-            startedAtMs,
-          ),
-        )
-      : null;
-    const subscriptionLimitsFiber = yield* refreshSubscriptionLimits(codexSnapshot).pipe(
+    const codexSnapshot =
+      shouldReadCodexTranscriptSnapshot(
+        subscriptionLimitsCache.get(subscriptionLimitsContext.codex.cacheKey),
+        startedAtMs,
+      ) && subscriptionLimitsContext.codex.canUseTranscriptSnapshot
+        ? yield* Effect.promise(() =>
+            readFreshCodexRateLimitsSnapshot(
+              codexFiles,
+              startedAtMs - SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS,
+              startedAtMs,
+            ),
+          )
+        : null;
+    const subscriptionLimitsFiber = yield* refreshSubscriptionLimits(
+      subscriptionLimitsContext,
+      codexSnapshot,
+    ).pipe(
       // Subscription meters are optional. Provider payload drift must not make
       // transcript usage unavailable.
       Effect.catchCause(() => Effect.void),
@@ -636,7 +677,7 @@ export const make = Effect.gen(function* () {
     const finishedAtMs = yield* Clock.currentTimeMillis;
     const subscriptionLimits = yield* awaitSubscriptionLimits(
       subscriptionLimitsFiber,
-      readCurrentSubscriptionLimits(),
+      readCurrentSubscriptionLimits(subscriptionLimitsContext),
     );
 
     return {

@@ -7,6 +7,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   awaitSubscriptionLimits,
+  makeSubscriptionLimitsCacheKey,
   makeSubscriptionLimitsCacheEntry,
   makeSubscriptionLimitsDevFixture,
   normalizeClaudeSubscriptionLimits,
@@ -18,6 +19,30 @@ import {
 } from "./usageSubscriptionLimits.ts";
 
 describe("subscription usage limits", () => {
+  it("isolates cached limits by provider runtime and account home", () => {
+    const claudeAccount = makeSubscriptionLimitsCacheKey({
+      provider: "claude",
+      binaryPath: "claude",
+      homePath: "/accounts/claude-a",
+    });
+    const cache = new Map([[claudeAccount, "account-a"]]);
+
+    const otherClaudeAccount = makeSubscriptionLimitsCacheKey({
+      provider: "claude",
+      binaryPath: "claude",
+      homePath: "/accounts/claude-b",
+    });
+    expect(cache.get(otherClaudeAccount)).toBeUndefined();
+    expect(
+      makeSubscriptionLimitsCacheKey({
+        provider: "codex",
+        binaryPath: "codex",
+        homePath: "/accounts/claude-a",
+        launchArgs: "--config profile=work",
+      }),
+    ).not.toBe(claudeAccount);
+  });
+
   it("normalizes Claude's five-hour and weekly windows", () => {
     const limits = normalizeClaudeSubscriptionLimits({
       subscription_type: "max",

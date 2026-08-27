@@ -2,6 +2,7 @@ import type { SDKControlGetUsageResponse } from "@anthropic-ai/claude-agent-sdk"
 import type {
   UsageLimitWindow,
   UsageLimitWindowKind,
+  UsageProviderKind,
   UsageProviderLimits,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
@@ -37,6 +38,23 @@ export interface SubscriptionLimitsCacheEntry {
     readonly limits: UsageProviderLimits | null;
     readonly observedAtMs: number;
   };
+}
+
+export interface SubscriptionLimitsCacheIdentity {
+  readonly provider: UsageProviderKind;
+  readonly binaryPath: string;
+  readonly homePath: string;
+  readonly launchArgs?: string;
+}
+
+/** Keeps cached quota data scoped to the provider runtime and account home that produced it. */
+export function makeSubscriptionLimitsCacheKey(identity: SubscriptionLimitsCacheIdentity): string {
+  return JSON.stringify([
+    identity.provider,
+    identity.binaryPath,
+    identity.homePath,
+    identity.launchArgs ?? null,
+  ]);
 }
 
 const subscriptionLimitsProbeFailure = { _tag: "Failure" } as const;
