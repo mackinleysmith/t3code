@@ -11,8 +11,10 @@ remaining until it resets. On web and desktop, hover a meter to see the exact re
 that do not expose quota data omit the meters. Claude also shows model-scoped weekly windows, such
 as Fable, when the subscription reports them.
 
-Codex shows `∞` only when the provider explicitly reports unlimited credits. Otherwise it shows
-only the quota windows returned for the signed-in Codex plan.
+Codex shows only the quota windows returned for the signed-in plan. Recent Codex sessions can
+supply the same account-accurate snapshot without another provider request; otherwise T3 Code asks
+the local Codex CLI. If a refresh fails, the last successful meters remain visible with their age
+until a later refresh succeeds.
 
 Use **Past 24h** for an hourly chart covering the exact rolling 24-hour period. The **7 days**,
 **30 days**, and **90 days** ranges use daily resolution. Cost and token toggles update both the

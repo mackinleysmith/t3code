@@ -16,6 +16,7 @@ import {
   formatHourShort,
   formatPercent,
   formatTokens,
+  formatUsageObservationAge,
   formatUsageResetCountdown,
   formatUsageResetDateTime,
   formatUsd,
@@ -516,8 +517,17 @@ function UsageLimitMeters({
   readonly timeZone: string;
 }) {
   const providerLabel = PROVIDER_PRESENTATION[limits.provider].label;
+  const observationAge =
+    limits.stale === true && limits.observedAt
+      ? formatUsageObservationAge(limits.observedAt, nowMs)
+      : null;
   return (
     <div className={USAGE_LIMITS_CLASS_NAME}>
+      {observationAge ? (
+        <span className="text-[9px] leading-none text-muted-foreground/70 tabular-nums">
+          Limits last updated {observationAge} ago
+        </span>
+      ) : null}
       {limits.windows.map((window) => {
         const percent = Math.min(100, Math.max(0, window.usedPercent));
         const reset = window.resetsAt ? formatUsageResetDateTime(window.resetsAt, timeZone) : null;

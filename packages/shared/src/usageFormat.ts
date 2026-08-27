@@ -65,6 +65,19 @@ export function formatUsageResetCountdown(resetsAt: string, nowMs: number): stri
   return `${minutes}m`;
 }
 
+/** Compact age for a last-known-good subscription-limit snapshot. */
+export function formatUsageObservationAge(observedAt: string, nowMs: number): string | null {
+  const observedAtMs = Date.parse(observedAt);
+  if (Number.isNaN(observedAtMs)) return null;
+
+  const totalMinutes = Math.max(0, Math.floor((nowMs - observedAtMs) / MINUTE_MS));
+  if (totalMinutes < 1) return "less than a minute";
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours}h`;
+  return `${Math.floor(totalHours / 24)}d`;
+}
+
 /** Exact reset instant for subscription-limit details, including minutes. */
 export function formatUsageResetDateTime(instant: string, timeZone?: string): string | null {
   const date = new Date(instant);

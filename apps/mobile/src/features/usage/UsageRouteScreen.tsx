@@ -9,6 +9,7 @@ import {
   formatHourShort,
   formatPercent,
   formatTokens,
+  formatUsageObservationAge,
   formatUsageResetCountdown,
   formatUsageResetDateTime,
   formatUsd,
@@ -389,8 +390,17 @@ function UsageLimitMeters(props: {
   readonly nowMs: number;
   readonly timeZone: string;
 }) {
+  const observationAge =
+    props.limits.stale === true && props.limits.observedAt
+      ? formatUsageObservationAge(props.limits.observedAt, props.nowMs)
+      : null;
   return (
     <View className="gap-2.5 py-1">
+      {observationAge ? (
+        <Text className="text-[11px] tabular-nums text-foreground-tertiary">
+          Limits last updated {observationAge} ago
+        </Text>
+      ) : null}
       {props.limits.windows.map((window) => {
         const percent = Math.min(100, Math.max(0, window.usedPercent));
         const reset = window.resetsAt

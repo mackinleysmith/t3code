@@ -18,12 +18,18 @@ import * as NodeReadline from "node:readline";
 import type { UsageProviderKind } from "@t3tools/contracts";
 
 import {
+  parseCodexTranscriptRateLimitsSnapshot,
+  type CodexTranscriptRateLimitsSnapshot,
+} from "./usageSubscriptionLimits.ts";
+import {
   initialCodexScanState,
   mightCarryUsage,
   parseClaudeLine,
   parseCodexLine,
   type UsageRecord,
 } from "./usageTranscripts.ts";
+
+const CODEX_RATE_LIMIT_TAIL_BYTES = 1024 * 1024;
 
 export interface TranscriptFile {
   readonly path: string;
@@ -87,6 +93,51 @@ export async function readDirectoryVolumeId(path: string): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/**
+ * Reads recent Codex rollout tails for the newest account-accurate rate-limit snapshot.
+ *
+ * Only the final MiB of each recently modified rollout is inspected. Missing a snapshot
+ * merely falls back to the native probe; a stale snapshot is never returned as current.
+ */
+export async function readFreshCodexRateLimitsSnapshot(
+  files: readonly TranscriptFile[],
+  sinceMs: number,
+): Promise<CodexTranscriptRateLimitsSnapshot | null> {
+  const candidates = files
+    .filter((file) => file.mtimeMs >= sinceMs)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let newest: CodexTranscriptRateLimitsSnapshot | null = null;
+
+  for (const file of candidates) {
+    let handle: NodeFSP.FileHandle | undefined;
+    try {
+      handle = await NodeFSP.open(file.path, "r");
+      const stats = await handle.stat();
+      const length = Math.min(stats.size, CODEX_RATE_LIMIT_TAIL_BYTES);
+      const offset = stats.size - length;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, offset);
+      const lines = buffer.toString("utf8").split(/\r?\n/);
+      if (offset > 0) lines.shift();
+
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        if (line === undefined || !line.includes('"rate_limits"')) continue;
+        const snapshot = parseCodexTranscriptRateLimitsSnapshot(line);
+        if (snapshot === null || snapshot.observedAtMs < sinceMs) continue;
+        if (newest === null || snapshot.observedAtMs > newest.observedAtMs) newest = snapshot;
+        break;
+      }
+    } catch {
+      // Rollouts can rotate while the Usage page scans. The probe remains the fallback.
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  return newest;
 }
 
 /**

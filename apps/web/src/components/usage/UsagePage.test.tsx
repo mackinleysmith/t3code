@@ -206,6 +206,8 @@ describe("UsagePage subscription limits", () => {
           {
             provider: "codex",
             plan: "pro",
+            observedAt: "2026-08-26T20:00:00.000Z",
+            stale: true,
             windows: [
               { kind: "fiveHour", usedPercent: 0, resetsAt: null, unlimited: true },
               {
@@ -231,6 +233,7 @@ describe("UsagePage subscription limits", () => {
     expect(markup).toContain("∞");
     expect(markup).toContain("No limit");
     expect(markup).toContain("Resets in");
+    expect(markup).toContain("Limits last updated");
     expect(markup).toContain("Aug 29, 9:00 PM");
     expect(markup).toContain("of cost");
     expect(markup.indexOf("of cost")).toBeLessThan(markup.indexOf('aria-label="Codex 5h limit"'));

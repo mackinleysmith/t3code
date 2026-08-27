@@ -11,6 +11,7 @@ import {
   makeSubscriptionLimitsDevFixture,
   normalizeClaudeSubscriptionLimits,
   normalizeCodexSubscriptionLimits,
+  parseCodexTranscriptRateLimitsSnapshot,
   readSubscriptionLimitsCacheEntry,
   runSubscriptionLimitsProbe,
 } from "./usageSubscriptionLimits.ts";
@@ -49,22 +50,23 @@ describe("subscription usage limits", () => {
   });
 
   it("normalizes Claude's live model-scoped weekly window shape", () => {
-    const limits = normalizeClaudeSubscriptionLimits({
+    const response = {
       subscription_type: "max",
       rate_limits_available: true,
       rate_limits: {
         five_hour: null,
         seven_day: { utilization: 3, resets_at: "2026-09-01T23:00:00.000Z" },
+        limits: [
+          {
+            kind: "weekly_scoped",
+            percent: 95,
+            resets_at: "2026-09-01T23:00:00.000Z",
+            scope: { model: { display_name: "Fable" } },
+          },
+        ],
       },
-      limits: [
-        {
-          kind: "weekly_scoped",
-          percent: 95,
-          resets_at: "2026-09-01T23:00:00.000Z",
-          scope: { model: { display_name: "Fable" } },
-        },
-      ],
-    });
+    } as Parameters<typeof normalizeClaudeSubscriptionLimits>[0];
+    const limits = normalizeClaudeSubscriptionLimits(response);
 
     expect(limits?.windows).toEqual([
       {
@@ -166,25 +168,100 @@ describe("subscription usage limits", () => {
     ]);
   });
 
-  it("shows an unlimited Codex five-hour window only when the provider reports it", () => {
+  it("classifies Codex windows within the upstream five-percent tolerance", () => {
     const limits = normalizeCodexSubscriptionLimits({
       rateLimits: {
-        planType: "pro",
-        credits: { balance: null, hasCredits: false, unlimited: true },
-        secondary: { usedPercent: 44, windowDurationMins: 10_080, resetsAt: null },
+        primary: { usedPercent: 44, windowDurationMins: 10_079, resetsAt: null },
+        secondary: { usedPercent: 12, windowDurationMins: 43_201, resetsAt: null },
       },
     });
 
     expect(limits?.windows).toEqual([
       {
-        kind: "fiveHour",
-        label: "5h",
-        usedPercent: 0,
+        kind: "weekly",
+        label: "Week",
+        usedPercent: 44,
         resetsAt: null,
-        unlimited: true,
+        unlimited: false,
       },
-      { kind: "weekly", label: "Week", usedPercent: 44, resetsAt: null, unlimited: false },
+      { kind: "monthly", label: "Month", usedPercent: 12, resetsAt: null, unlimited: false },
     ]);
+
+    expect(
+      normalizeCodexSubscriptionLimits({
+        rateLimits: {
+          primary: { usedPercent: 7, windowDurationMins: 1_439, resetsAt: null },
+          secondary: { usedPercent: 2, windowDurationMins: 525_599, resetsAt: null },
+        },
+      })?.windows.map(({ kind, label }) => ({ kind, label })),
+    ).toEqual([
+      { kind: "daily", label: "Day" },
+      { kind: "annual", label: "Year" },
+    ]);
+  });
+
+  it("uses neutral labels when Codex omits window durations", () => {
+    const limits = normalizeCodexSubscriptionLimits({
+      rateLimits: {
+        primary: { usedPercent: 44, resetsAt: null },
+        secondary: { usedPercent: 12, resetsAt: null },
+      },
+    });
+
+    expect(limits?.windows).toEqual([
+      {
+        kind: "codex:primary",
+        label: "Usage",
+        usedPercent: 44,
+        resetsAt: null,
+        unlimited: false,
+      },
+      {
+        kind: "codex:secondary",
+        label: "Secondary",
+        usedPercent: 12,
+        resetsAt: null,
+        unlimited: false,
+      },
+    ]);
+  });
+
+  it("reads Codex rate limits from a persisted token-count event", () => {
+    expect(
+      parseCodexTranscriptRateLimitsSnapshot(
+        JSON.stringify({
+          timestamp: "2026-08-27T02:10:00.000Z",
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: {
+              rate_limits: {
+                primary: null,
+                secondary: {
+                  used_percent: 57,
+                  window_minutes: 10_080,
+                  resets_at: 1_788_000_000,
+                },
+                plan_type: "prolite",
+              },
+            },
+          },
+        }),
+      ),
+    ).toEqual({
+      observedAtMs: Date.parse("2026-08-27T02:10:00.000Z"),
+      response: {
+        rateLimits: {
+          planType: "prolite",
+          primary: null,
+          secondary: {
+            usedPercent: 57,
+            windowDurationMins: 10_080,
+            resetsAt: 1_788_000_000,
+          },
+        },
+      },
+    });
   });
 
   it("clamps provider percentages to the progress bar range", () => {
@@ -250,11 +327,68 @@ describe("subscription usage limits", () => {
     expect(readSubscriptionLimitsCacheEntry(entry, 181_000)).toBeUndefined();
   });
 
+  it("does not extend a transcript snapshot beyond three minutes from observation", () => {
+    const entry = makeSubscriptionLimitsCacheEntry(
+      { _tag: "Success", limits: null },
+      120_000,
+      undefined,
+      1_000,
+    );
+
+    expect(readSubscriptionLimitsCacheEntry(entry, 180_999)).toEqual({
+      _tag: "Success",
+      limits: null,
+    });
+    expect(readSubscriptionLimitsCacheEntry(entry, 181_000)).toBeUndefined();
+  });
+
   it("backs off failed probes for ten minutes", () => {
     const entry = makeSubscriptionLimitsCacheEntry({ _tag: "Failure" }, 1_000);
 
     expect(readSubscriptionLimitsCacheEntry(entry, 600_999)).toEqual({ _tag: "Failure" });
     expect(readSubscriptionLimitsCacheEntry(entry, 601_000)).toBeUndefined();
+  });
+
+  it("retains the last known good limits when a refresh fails", () => {
+    const success = makeSubscriptionLimitsCacheEntry(
+      {
+        _tag: "Success",
+        limits: {
+          provider: "codex",
+          plan: "prolite",
+          windows: [
+            {
+              kind: "weekly",
+              label: "Week",
+              usedPercent: 57,
+              resetsAt: null,
+              unlimited: false,
+            },
+          ],
+        },
+      },
+      1_000,
+    );
+    const failed = makeSubscriptionLimitsCacheEntry({ _tag: "Failure" }, 181_000, success);
+
+    expect(readSubscriptionLimitsCacheEntry(failed, 181_001)).toEqual({
+      _tag: "Success",
+      limits: {
+        provider: "codex",
+        plan: "prolite",
+        windows: [
+          {
+            kind: "weekly",
+            label: "Week",
+            usedPercent: 57,
+            resetsAt: null,
+            unlimited: false,
+          },
+        ],
+        observedAt: "1970-01-01T00:00:01.000Z",
+        stale: true,
+      },
+    });
   });
 
   it("provides representative limits only for the explicit dev fixture", () => {
@@ -266,13 +400,6 @@ describe("subscription usage limits", () => {
         provider: "codex",
         plan: "pro",
         windows: [
-          {
-            kind: "fiveHour",
-            label: "5h",
-            usedPercent: 0,
-            resetsAt: null,
-            unlimited: true,
-          },
           {
             kind: "weekly",
             label: "Week",

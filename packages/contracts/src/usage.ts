@@ -182,6 +182,10 @@ export const UsageProviderLimits = Schema.Struct({
   provider: UsageProviderKind,
   plan: Schema.NullOr(TrimmedNonEmptyString),
   windows: Schema.Array(UsageLimitWindow),
+  /** When the provider or local transcript observed these values. */
+  observedAt: Schema.optionalKey(TrimmedNonEmptyString),
+  /** True when a failed refresh is serving the last known good values. */
+  stale: Schema.optionalKey(Schema.Boolean),
 });
 export type UsageProviderLimits = typeof UsageProviderLimits.Type;
 

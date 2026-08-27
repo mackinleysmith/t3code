@@ -6,6 +6,7 @@ import {
   formatDateTimeShort,
   formatHourShort,
   formatRelativeHourShort,
+  formatUsageObservationAge,
   formatUsageResetCountdown,
   formatUsageResetDateTime,
   makeWindow,
@@ -96,5 +97,11 @@ describe("subscription reset formatting", () => {
     expect(formatUsageResetDateTime("2026-08-26T19:14:00.000Z", "UTC")).toBe("Aug 26, 7:14 PM");
     expect(formatUsageResetDateTime("not-a-date", "UTC")).toBeNull();
     expect(formatUsageResetDateTime("2026-08-26T19:14:00.000Z", "Etc/Unknown")).toBeNull();
+  });
+
+  it("formats the age of a retained subscription-limit snapshot", () => {
+    expect(formatUsageObservationAge("2026-08-26T16:55:00.000Z", now)).toBe("5m");
+    expect(formatUsageObservationAge("2026-08-26T14:00:00.000Z", now)).toBe("3h");
+    expect(formatUsageObservationAge("not-a-date", now)).toBeNull();
   });
 });

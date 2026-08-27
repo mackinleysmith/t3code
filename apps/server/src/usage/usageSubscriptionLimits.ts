@@ -9,10 +9,13 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
-import type * as CodexSchema from "effect-codex-app-server/schema";
+import * as Schema from "effect/Schema";
 
 const FIVE_HOURS_MINUTES = 5 * 60;
+const DAY_MINUTES = 24 * 60;
 const WEEK_MINUTES = 7 * 24 * 60;
+const MONTH_MINUTES = 30 * DAY_MINUTES;
+const YEAR_MINUTES = 365 * DAY_MINUTES;
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
 
@@ -30,6 +33,10 @@ export type SubscriptionLimitsProbeOutcome =
 export interface SubscriptionLimitsCacheEntry {
   readonly expiresAtMs: number;
   readonly outcome: SubscriptionLimitsProbeOutcome;
+  readonly lastSuccess?: {
+    readonly limits: UsageProviderLimits | null;
+    readonly observedAtMs: number;
+  };
 }
 
 const subscriptionLimitsProbeFailure = { _tag: "Failure" } as const;
@@ -66,29 +73,137 @@ export const awaitSubscriptionLimits = Effect.fn("awaitSubscriptionLimits")(
 export function makeSubscriptionLimitsCacheEntry(
   outcome: SubscriptionLimitsProbeOutcome,
   nowMs: number,
+  previous?: SubscriptionLimitsCacheEntry,
+  observedAtMs = nowMs,
 ): SubscriptionLimitsCacheEntry {
   const ttlMs =
     outcome._tag === "Success"
       ? SUBSCRIPTION_LIMITS_SUCCESS_TTL_MS
       : SUBSCRIPTION_LIMITS_FAILURE_TTL_MS;
-  return { expiresAtMs: nowMs + ttlMs, outcome };
+  const expiresAtMs =
+    outcome._tag === "Success" ? Math.min(nowMs + ttlMs, observedAtMs + ttlMs) : nowMs + ttlMs;
+  const lastSuccess =
+    outcome._tag === "Success" ? { limits: outcome.limits, observedAtMs } : previous?.lastSuccess;
+  return {
+    expiresAtMs,
+    outcome,
+    ...(lastSuccess === undefined ? {} : { lastSuccess }),
+  };
 }
 
 export function readSubscriptionLimitsCacheEntry(
   entry: SubscriptionLimitsCacheEntry | undefined,
   nowMs: number,
 ): SubscriptionLimitsProbeOutcome | undefined {
-  return entry !== undefined && nowMs < entry.expiresAtMs ? entry.outcome : undefined;
+  if (entry === undefined || nowMs >= entry.expiresAtMs) return undefined;
+  if (entry.outcome._tag === "Success") {
+    return {
+      _tag: "Success",
+      limits: stampSubscriptionLimits(entry.outcome.limits, entry.lastSuccess?.observedAtMs, false),
+    };
+  }
+  if (entry.lastSuccess === undefined) return entry.outcome;
+  return {
+    _tag: "Success",
+    limits: stampSubscriptionLimits(entry.lastSuccess.limits, entry.lastSuccess.observedAtMs, true),
+  };
+}
+
+function stampSubscriptionLimits(
+  limits: UsageProviderLimits | null,
+  observedAtMs: number | undefined,
+  stale: boolean,
+): UsageProviderLimits | null {
+  if (limits === null || observedAtMs === undefined) return limits;
+  return {
+    ...limits,
+    observedAt: DateTime.formatIso(DateTime.makeUnsafe(observedAtMs)),
+    stale,
+  };
 }
 
 type ClaudeUsageLimitsResponse = Partial<
   Pick<SDKControlGetUsageResponse, "subscription_type" | "rate_limits_available" | "rate_limits">
 > & {
-  /** Newer Claude responses expose model-scoped weekly windows here. */
+  /** Compatibility fallback for SDK builds that project model-scoped limits at the top level. */
   readonly limits?: unknown;
 };
 
-type CodexUsageLimitsResponse = Pick<CodexSchema.V2GetAccountRateLimitsResponse, "rateLimits">;
+interface CodexRateLimitWindowResponse {
+  readonly usedPercent: number;
+  readonly windowDurationMins?: number | null;
+  readonly resetsAt?: number | null;
+}
+
+export interface CodexUsageLimitsResponse {
+  readonly rateLimits: {
+    readonly planType?: string | null;
+    readonly primary?: CodexRateLimitWindowResponse | null;
+    readonly secondary?: CodexRateLimitWindowResponse | null;
+  };
+}
+
+export interface CodexTranscriptRateLimitsSnapshot {
+  readonly observedAtMs: number;
+  readonly response: CodexUsageLimitsResponse;
+}
+
+const NullableNumber = Schema.Union([Schema.Number, Schema.Null]);
+const CodexTranscriptRateLimitWindow = Schema.Struct({
+  used_percent: Schema.Number,
+  window_minutes: Schema.optionalKey(NullableNumber),
+  resets_at: Schema.optionalKey(NullableNumber),
+});
+const CodexTranscriptRateLimitsEvent = Schema.Struct({
+  timestamp: Schema.String,
+  payload: Schema.Struct({
+    type: Schema.Literal("token_count"),
+    info: Schema.Struct({
+      rate_limits: Schema.Struct({
+        primary: Schema.optionalKey(Schema.Union([CodexTranscriptRateLimitWindow, Schema.Null])),
+        secondary: Schema.optionalKey(Schema.Union([CodexTranscriptRateLimitWindow, Schema.Null])),
+        plan_type: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
+      }),
+    }),
+  }),
+});
+const decodeCodexTranscriptRateLimitsEvent = Schema.decodeUnknownOption(
+  Schema.fromJsonString(CodexTranscriptRateLimitsEvent),
+);
+
+function codexTranscriptWindow(
+  window: typeof CodexTranscriptRateLimitWindow.Type | null | undefined,
+): CodexRateLimitWindowResponse | null | undefined {
+  if (window === null || window === undefined) return window;
+  return {
+    usedPercent: window.used_percent,
+    ...(window.window_minutes === undefined ? {} : { windowDurationMins: window.window_minutes }),
+    ...(window.resets_at === undefined ? {} : { resetsAt: window.resets_at }),
+  };
+}
+
+/** Reads the account-accurate rate-limit snapshot Codex persists after a turn. */
+export function parseCodexTranscriptRateLimitsSnapshot(
+  line: string,
+): CodexTranscriptRateLimitsSnapshot | null {
+  const decoded = decodeCodexTranscriptRateLimitsEvent(line);
+  if (Option.isNone(decoded)) return null;
+  const observedAtMs = Date.parse(decoded.value.timestamp);
+  if (!Number.isFinite(observedAtMs)) return null;
+  const limits = decoded.value.payload.info.rate_limits;
+  const primary = codexTranscriptWindow(limits.primary);
+  const secondary = codexTranscriptWindow(limits.secondary);
+  return {
+    observedAtMs,
+    response: {
+      rateLimits: {
+        ...(limits.plan_type === undefined ? {} : { planType: limits.plan_type }),
+        ...(primary === undefined ? {} : { primary }),
+        ...(secondary === undefined ? {} : { secondary }),
+      },
+    },
+  };
+}
 
 function usedPercent(value: number | null): number | null {
   if (value === null || !Number.isFinite(value)) return null;
@@ -206,18 +321,43 @@ export function normalizeClaudeSubscriptionLimits(
   };
 }
 
-function codexWindowKind(
-  window: CodexSchema.V2GetAccountRateLimitsResponse__RateLimitWindow,
-  fallback: UsageLimitWindowKind,
-): UsageLimitWindowKind {
-  if (window.windowDurationMins === FIVE_HOURS_MINUTES) return "fiveHour";
-  if (window.windowDurationMins === WEEK_MINUTES) return "weekly";
-  return fallback;
+interface CodexWindowPresentation {
+  readonly kind: UsageLimitWindowKind;
+  readonly label: string;
+}
+
+const CODEX_WINDOW_PRESENTATIONS = [
+  { minutes: FIVE_HOURS_MINUTES, kind: "fiveHour", label: "5h" },
+  { minutes: DAY_MINUTES, kind: "daily", label: "Day" },
+  { minutes: WEEK_MINUTES, kind: "weekly", label: "Week" },
+  { minutes: MONTH_MINUTES, kind: "monthly", label: "Month" },
+  { minutes: YEAR_MINUTES, kind: "annual", label: "Year" },
+] as const;
+
+function isApproximateCodexWindow(actualMinutes: number, expectedMinutes: number): boolean {
+  return actualMinutes >= expectedMinutes * 0.95 && actualMinutes <= expectedMinutes * 1.05;
+}
+
+function codexWindowPresentation(
+  window: CodexRateLimitWindowResponse,
+  position: "primary" | "secondary",
+): CodexWindowPresentation {
+  const duration = window.windowDurationMins;
+  if (duration !== null && duration !== undefined && Number.isFinite(duration)) {
+    const known = CODEX_WINDOW_PRESENTATIONS.find((candidate) =>
+      isApproximateCodexWindow(duration, candidate.minutes),
+    );
+    if (known !== undefined) return known;
+  }
+  return {
+    kind: `codex:${position}`,
+    label: position === "primary" ? "Usage" : "Secondary",
+  };
 }
 
 function codexWindow(
-  window: CodexSchema.V2GetAccountRateLimitsResponse__RateLimitWindow | null | undefined,
-  fallback: UsageLimitWindowKind,
+  window: CodexRateLimitWindowResponse | null | undefined,
+  position: "primary" | "secondary",
 ): UsageLimitWindow | null {
   if (!window) return null;
   const percent = usedPercent(window.usedPercent);
@@ -227,9 +367,10 @@ function codexWindow(
     window.resetsAt === null || window.resetsAt === undefined
       ? null
       : DateTime.formatIso(DateTime.makeUnsafe(window.resetsAt * 1_000));
+  const presentation = codexWindowPresentation(window, position);
   return {
-    kind: codexWindowKind(window, fallback),
-    label: codexWindowKind(window, fallback) === "fiveHour" ? "5h" : "Week",
+    kind: presentation.kind,
+    label: presentation.label,
     usedPercent: percent,
     resetsAt,
     unlimited: false,
@@ -242,30 +383,15 @@ export function normalizeCodexSubscriptionLimits(
   if (!response) return null;
 
   const meteredWindows = [
-    codexWindow(response.rateLimits.primary, "fiveHour"),
-    codexWindow(response.rateLimits.secondary, "weekly"),
+    codexWindow(response.rateLimits.primary, "primary"),
+    codexWindow(response.rateLimits.secondary, "secondary"),
   ].filter((window): window is UsageLimitWindow => window !== null);
-  const unlimitedFiveHour =
-    response.rateLimits.credits?.unlimited === true &&
-    !meteredWindows.some((window) => window.kind === "fiveHour");
-  const windows = unlimitedFiveHour
-    ? [
-        {
-          kind: "fiveHour",
-          label: "5h",
-          usedPercent: 0,
-          resetsAt: null,
-          unlimited: true,
-        } satisfies UsageLimitWindow,
-        ...meteredWindows,
-      ]
-    : meteredWindows;
-  if (windows.length === 0) return null;
+  if (meteredWindows.length === 0) return null;
 
   return {
     provider: "codex",
     plan: response.rateLimits.planType ?? null,
-    windows,
+    windows: meteredWindows,
   };
 }
 
@@ -302,7 +428,6 @@ export function makeSubscriptionLimitsDevFixture(
   const codex = normalizeCodexSubscriptionLimits({
     rateLimits: {
       planType: "pro",
-      credits: { balance: null, hasCredits: false, unlimited: true },
       secondary: {
         usedPercent: 47,
         windowDurationMins: WEEK_MINUTES,
