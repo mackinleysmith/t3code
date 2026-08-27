@@ -7,22 +7,22 @@ import { describe, expect, it } from "@effect/vitest";
 
 import { readFreshCodexRateLimitsSnapshot } from "./usageTranscriptReader.ts";
 
-function rateLimitLine(timestamp: string, usedPercent: number): string {
+function rateLimitLine(timestamp: string, usedPercent: number, limitId = "codex"): string {
   return JSON.stringify({
     timestamp,
     type: "event_msg",
     payload: {
       type: "token_count",
-      info: {
-        rate_limits: {
-          primary: null,
-          secondary: {
-            used_percent: usedPercent,
-            window_minutes: 10_080,
-            resets_at: 1_788_000_000,
-          },
-          plan_type: "prolite",
+      info: null,
+      rate_limits: {
+        limit_id: limitId,
+        primary: null,
+        secondary: {
+          used_percent: usedPercent,
+          window_minutes: 10_080,
+          resets_at: 1_788_000_000,
         },
+        plan_type: "prolite",
       },
     },
   });
@@ -36,9 +36,17 @@ describe("Codex transcript rate-limit snapshots", () => {
       const olderAt = "2026-08-27T02:09:00.000Z";
       const newerAt = "2026-08-27T02:10:00.000Z";
       const futureAt = "2036-08-27T02:10:00.000Z";
+      const sparkAt = "2026-08-27T02:10:20.000Z";
       await NodeFSP.writeFile(
         path,
-        `${rateLimitLine(olderAt, 40)}\n${rateLimitLine(newerAt, 57)}\n${rateLimitLine(futureAt, 99)}\n`,
+        [
+          rateLimitLine(olderAt, 40),
+          rateLimitLine(newerAt, 57),
+          // A newer model-scoped bucket must not shadow the account limit.
+          rateLimitLine(sparkAt, 0, "codex_bengalfox"),
+          rateLimitLine(futureAt, 99),
+          "",
+        ].join("\n"),
       );
       const stats = await NodeFSP.stat(path);
       const files = [{ path, size: stats.size, mtimeMs: stats.mtimeMs }];

@@ -297,16 +297,16 @@ describe("subscription usage limits", () => {
           type: "event_msg",
           payload: {
             type: "token_count",
-            info: {
-              rate_limits: {
-                primary: null,
-                secondary: {
-                  used_percent: 57,
-                  window_minutes: 10_080,
-                  resets_at: 1_788_000_000,
-                },
-                plan_type: "prolite",
+            info: null,
+            rate_limits: {
+              limit_id: "codex",
+              primary: null,
+              secondary: {
+                used_percent: 57,
+                window_minutes: 10_080,
+                resets_at: 1_788_000_000,
               },
+              plan_type: "prolite",
             },
           },
         }),
@@ -315,6 +315,7 @@ describe("subscription usage limits", () => {
       observedAtMs: Date.parse("2026-08-27T02:10:00.000Z"),
       response: {
         rateLimits: {
+          limitId: "codex",
           planType: "prolite",
           primary: null,
           secondary: {
@@ -325,6 +326,38 @@ describe("subscription usage limits", () => {
         },
       },
     });
+  });
+
+  it("ignores model-scoped Codex limit buckets", () => {
+    const line = (limitId: string | null | undefined) =>
+      JSON.stringify({
+        timestamp: "2026-08-27T02:10:00.000Z",
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          rate_limits: {
+            ...(limitId === undefined ? {} : { limit_id: limitId }),
+            primary: { used_percent: 0, window_minutes: 300, resets_at: 1_788_000_000 },
+            secondary: null,
+            plan_type: "prolite",
+          },
+        },
+      });
+
+    expect(parseCodexTranscriptRateLimitsSnapshot(line("codex_bengalfox"))).toBeNull();
+    expect(parseCodexTranscriptRateLimitsSnapshot(line("codex"))).not.toBeNull();
+    expect(parseCodexTranscriptRateLimitsSnapshot(line(null))).not.toBeNull();
+    expect(parseCodexTranscriptRateLimitsSnapshot(line(undefined))).not.toBeNull();
+
+    expect(
+      normalizeCodexSubscriptionLimits({
+        rateLimits: {
+          limitId: "codex_bengalfox",
+          planType: "prolite",
+          primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1_788_000_000 },
+        },
+      }),
+    ).toBeNull();
   });
 
   it("clamps provider percentages to the progress bar range", () => {
@@ -352,7 +385,10 @@ describe("subscription usage limits", () => {
         ],
       } satisfies UsageProviderLimits;
       const providerFiber = yield* Effect.sleep(Duration.seconds(10)).pipe(Effect.forkScoped);
-      const result = yield* awaitSubscriptionLimits(providerFiber, Effect.succeed([limits]));
+      const result = yield* awaitSubscriptionLimits(
+        providerFiber,
+        Effect.succeed({ limits: [limits], settled: true }),
+      );
 
       expect(result).toEqual([limits]);
       expect(providerFiber.pollUnsafe()).toBeUndefined();
@@ -362,9 +398,10 @@ describe("subscription usage limits", () => {
   it.effect("returns after five seconds while a slow provider refresh keeps running", () =>
     Effect.gen(function* () {
       const providerFiber = yield* Effect.sleep(Duration.seconds(10)).pipe(Effect.forkScoped);
-      const waitFiber = yield* awaitSubscriptionLimits(providerFiber, Effect.succeed([])).pipe(
-        Effect.forkChild,
-      );
+      const waitFiber = yield* awaitSubscriptionLimits(
+        providerFiber,
+        Effect.succeed({ limits: [], settled: false }),
+      ).pipe(Effect.forkChild);
 
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(5));
@@ -395,13 +432,42 @@ describe("subscription usage limits", () => {
       );
       const waitFiber = yield* awaitSubscriptionLimits(
         providerFiber,
-        Effect.sync(() => current),
+        Effect.sync(() => ({ limits: current, settled: current.length > 0 })),
       ).pipe(Effect.forkChild);
 
       yield* Effect.yieldNow;
       yield* TestClock.adjust(Duration.seconds(3));
 
       expect(yield* Fiber.join(waitFiber)).toEqual([limits]);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("waits for the slower provider when only one provider is ready", () =>
+    Effect.gen(function* () {
+      const codex = {
+        provider: "codex",
+        plan: "plus",
+        windows: [{ kind: "weekly", usedPercent: 42, resetsAt: null }],
+      } satisfies UsageProviderLimits;
+      const claude = {
+        provider: "claude",
+        plan: "max",
+        windows: [{ kind: "fiveHour", usedPercent: 7, resetsAt: null }],
+      } satisfies UsageProviderLimits;
+      let current: readonly UsageProviderLimits[] = [codex];
+      const providerFiber = yield* Effect.sleep(Duration.seconds(2)).pipe(
+        Effect.tap(() => Effect.sync(() => (current = [codex, claude]))),
+        Effect.forkScoped,
+      );
+      const waitFiber = yield* awaitSubscriptionLimits(
+        providerFiber,
+        Effect.sync(() => ({ limits: current, settled: current.length === 2 })),
+      ).pipe(Effect.forkChild);
+
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(Duration.seconds(2));
+
+      expect(yield* Fiber.join(waitFiber)).toEqual([codex, claude]);
     }).pipe(Effect.provide(TestClock.layer())),
   );
 

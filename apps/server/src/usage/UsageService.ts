@@ -189,17 +189,18 @@ export const make = Effect.gen(function* () {
         hostEnvironment.T3CODE_DEV_USAGE_LIMITS_FIXTURE,
         now,
       );
-      if (fixture !== null) return fixture;
+      if (fixture !== null) return { limits: fixture, settled: true };
 
       const providers = [context.codex, context.claude].filter(({ enabled }) => enabled);
-
-      return providers.flatMap(({ cacheKey }) => {
-        const outcome = readSubscriptionLimitsCacheEntry(
-          subscriptionLimitsCache.get(cacheKey),
-          now,
-        );
-        return outcome?._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [];
-      });
+      const outcomes = providers.map(({ cacheKey }) =>
+        readSubscriptionLimitsCacheEntry(subscriptionLimitsCache.get(cacheKey), now),
+      );
+      return {
+        limits: outcomes.flatMap((outcome) =>
+          outcome?._tag === "Success" && outcome.limits !== null ? [outcome.limits] : [],
+        ),
+        settled: outcomes.every((outcome) => outcome !== undefined),
+      };
     },
   );
 

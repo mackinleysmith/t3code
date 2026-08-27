@@ -101,19 +101,29 @@ export const runSubscriptionLimitsProbe = Effect.fn("runSubscriptionLimitsProbe"
     ),
 );
 
-/** Returns ready limits immediately, otherwise gives the background refresh a short budget. */
+export interface SubscriptionLimitsReadResult {
+  readonly limits: readonly UsageProviderLimits[];
+  /** True once every enabled provider has a live cache entry, success or failure. */
+  readonly settled: boolean;
+}
+
+/**
+ * Returns limits immediately once every enabled provider has settled, otherwise
+ * gives the background refresh a short budget so a fast provider does not
+ * ship the page without the slower one's meters.
+ */
 export const awaitSubscriptionLimits = Effect.fn("awaitSubscriptionLimits")(function* (
   refreshFiber: Fiber.Fiber<void, never>,
-  readCurrent: Effect.Effect<readonly UsageProviderLimits[], never>,
+  readCurrent: Effect.Effect<SubscriptionLimitsReadResult, never>,
 ) {
   const ready = yield* readCurrent;
-  if (ready.length > 0) return ready;
+  if (ready.settled) return ready.limits;
 
   yield* Fiber.join(refreshFiber).pipe(
     Effect.timeoutOption(SUBSCRIPTION_LIMITS_READ_BUDGET_MS),
     Effect.asVoid,
   );
-  return yield* readCurrent;
+  return (yield* readCurrent).limits;
 });
 
 export function makeSubscriptionLimitsCacheEntry(
@@ -194,6 +204,8 @@ interface CodexRateLimitWindowResponse {
 
 export interface CodexUsageLimitsResponse {
   readonly rateLimits: {
+    /** Codex reports model-scoped buckets under other ids; only `codex` is the account limit. */
+    readonly limitId?: string | null;
     readonly planType?: string | null;
     readonly primary?: CodexRateLimitWindowResponse | null;
     readonly secondary?: CodexRateLimitWindowResponse | null;
@@ -211,19 +223,25 @@ const CodexTranscriptRateLimitWindow = Schema.Struct({
   window_minutes: Schema.optionalKey(NullableNumber),
   resets_at: Schema.optionalKey(NullableNumber),
 });
+const NullableString = Schema.Union([Schema.String, Schema.Null]);
+// `rate_limits` is a sibling of `info` on codex-rs `TokenCountEvent`, not nested inside it.
 const CodexTranscriptRateLimitsEvent = Schema.Struct({
   timestamp: Schema.String,
   payload: Schema.Struct({
     type: Schema.Literal("token_count"),
-    info: Schema.Struct({
-      rate_limits: Schema.Struct({
-        primary: Schema.optionalKey(Schema.Union([CodexTranscriptRateLimitWindow, Schema.Null])),
-        secondary: Schema.optionalKey(Schema.Union([CodexTranscriptRateLimitWindow, Schema.Null])),
-        plan_type: Schema.optionalKey(Schema.Union([Schema.String, Schema.Null])),
-      }),
+    rate_limits: Schema.Struct({
+      limit_id: Schema.optionalKey(NullableString),
+      primary: Schema.optionalKey(Schema.Union([CodexTranscriptRateLimitWindow, Schema.Null])),
+      secondary: Schema.optionalKey(Schema.Union([CodexTranscriptRateLimitWindow, Schema.Null])),
+      plan_type: Schema.optionalKey(NullableString),
     }),
   }),
 });
+
+/** Older Codex builds omit `limit_id`; newer ones tag model-scoped buckets such as Spark. */
+function isCodexAccountLimit(limitId: string | null | undefined): boolean {
+  return limitId === undefined || limitId === null || limitId === "codex";
+}
 const decodeCodexTranscriptRateLimitsEvent = Schema.decodeUnknownOption(
   Schema.fromJsonString(CodexTranscriptRateLimitsEvent),
 );
@@ -247,13 +265,15 @@ export function parseCodexTranscriptRateLimitsSnapshot(
   if (Option.isNone(decoded)) return null;
   const observedAtMs = Date.parse(decoded.value.timestamp);
   if (!Number.isFinite(observedAtMs)) return null;
-  const limits = decoded.value.payload.info.rate_limits;
+  const limits = decoded.value.payload.rate_limits;
+  if (!isCodexAccountLimit(limits.limit_id)) return null;
   const primary = codexTranscriptWindow(limits.primary);
   const secondary = codexTranscriptWindow(limits.secondary);
   return {
     observedAtMs,
     response: {
       rateLimits: {
+        ...(limits.limit_id === undefined ? {} : { limitId: limits.limit_id }),
         ...(limits.plan_type === undefined ? {} : { planType: limits.plan_type }),
         ...(primary === undefined ? {} : { primary }),
         ...(secondary === undefined ? {} : { secondary }),
@@ -434,7 +454,7 @@ function codexWindow(
 export function normalizeCodexSubscriptionLimits(
   response: CodexUsageLimitsResponse | undefined,
 ): UsageProviderLimits | null {
-  if (!response) return null;
+  if (!response || !isCodexAccountLimit(response.rateLimits.limitId)) return null;
 
   const meteredWindows = [
     codexWindow(response.rateLimits.primary, "primary"),
