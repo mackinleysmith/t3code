@@ -9,6 +9,9 @@ differences and apply one environment's preferences to the others.
 Use **Refresh models** in the model picker for a new or existing task to reload models for the
 selected computer. Other connected computers are not refreshed.
 
+Star a model to keep it in **Favorites**, including legacy models. Removing a star from a legacy
+model returns it to **Legacy models**.
+
 ## Providers and skills
 
 Open **Settings > Providers**, or **Providers** in the model picker, to manage a provider on its
@@ -40,6 +43,8 @@ the text is ready. Saved drafts load without waiting for the thread to catch up.
 One message can contain up to eight photos, videos, or files. Images can be up to 10 MB. Other
 files can be up to 50 MB, or the lower limit reported by the connected server. Older servers accept
 images only.
+
+You can also paste an image from the message field's edit menu or drag an image onto the composer.
 
 Attachments start uploading while you compose. **Preparing** means the attachment is waiting to
 start. Failed or timed-out uploads show **Retry** and keep the local copy. If the app cannot save
