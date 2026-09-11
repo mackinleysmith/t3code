@@ -279,7 +279,7 @@ private struct MarkdownBlocksView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: spacing) {
             ForEach(selectionGroups, id: \.lowerBound) { range in
-                if continuousSelection, MarkdownProseSelection.supports(blocks[range.lowerBound]) {
+                if continuousSelection, MarkdownContinuousSelection.supports(blocks[range.lowerBound]) {
                     MarkdownInlineText(
                         prose: Array(blocks[range]),
                         selectionContext: selectionContext,
@@ -301,7 +301,7 @@ private struct MarkdownBlocksView: View {
 
     private var selectionGroups: [Range<Int>] {
         continuousSelection
-            ? MarkdownProseSelection.groups(in: blocks)
+            ? MarkdownContinuousSelection.groups(in: blocks)
             : blocks.indices.map { $0..<($0 + 1) }
     }
 }
@@ -774,7 +774,8 @@ private struct MarkdownCodeBlockView: View {
             Group {
                 if wrapsLines {
                     MarkdownInlineText(
-                        renderedCode,
+                        code: renderedCode,
+                        language: language,
                         selectionContext: selectionContext,
                         lineSpacing: 3,
                         wrapsLines: true
@@ -784,7 +785,8 @@ private struct MarkdownCodeBlockView: View {
                 } else {
                     ScrollView(.horizontal) {
                         MarkdownInlineText(
-                            renderedCode,
+                            code: renderedCode,
+                            language: language,
                             selectionContext: selectionContext,
                             lineSpacing: 3,
                             wrapsLines: false
@@ -825,6 +827,7 @@ enum MarkdownCodeBlockWrapping {
 
 private enum MarkdownTextContent: Equatable {
     case inline(MarkdownRenderedInline)
+    case code(MarkdownRenderedInline, language: String?)
     case prose([MarkdownRenderedBlock])
 }
 
@@ -853,6 +856,20 @@ private struct MarkdownInlineText: UIViewRepresentable {
     }
 
     init(
+        code: MarkdownRenderedInline,
+        language: String?,
+        selectionContext: MarkdownSelectionContext,
+        lineSpacing: CGFloat,
+        wrapsLines: Bool
+    ) {
+        self.content = .code(code, language: language)
+        self.selectionContext = selectionContext
+        self.lineSpacing = lineSpacing
+        self.textColor = .primary
+        self.wrapsLines = wrapsLines
+    }
+
+    init(
         prose: [MarkdownRenderedBlock],
         selectionContext: MarkdownSelectionContext,
         textColor: MarkdownTextColor
@@ -869,7 +886,7 @@ private struct MarkdownInlineText: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> UITextView {
-        let textView = FeatureInlineSkillTextView()
+        let textView = MarkdownSelectionTextView(frame: .zero, textContainer: nil)
         textView.backgroundColor = .clear
         textView.isEditable = false
         textView.isSelectable = true
@@ -1001,8 +1018,8 @@ private struct MarkdownInlineText: UIViewRepresentable {
             }
             let attributedText: NSAttributedString
             switch content {
-            case let .inline(rendered):
-                attributedText = MarkdownSelectableTextAttributes.make(
+            case let .inline(rendered), let .code(rendered, _):
+                let inlineText = NSMutableAttributedString(attributedString: MarkdownSelectableTextAttributes.make(
                     from: rendered,
                     lineSpacing: lineSpacing,
                     foregroundColor: textColor.uiColor,
@@ -1010,9 +1027,13 @@ private struct MarkdownInlineText: UIViewRepresentable {
                     wrapsLines: wrapsLines,
                     skills: skills,
                     traits: traits
-                )
+                ))
+                if case let .code(_, language) = content {
+                    inlineText.addAttribute(.markdownCopyBlock, value: MarkdownCopyBlock(.code(language: language)), range: NSRange(location: 0, length: inlineText.length))
+                }
+                attributedText = inlineText
             case let .prose(blocks):
-                attributedText = MarkdownProseSelection.attributedText(
+                attributedText = MarkdownContinuousSelection.attributedText(
                     blocks: blocks,
                     foregroundColor: textColor.uiColor,
                     dynamicTypeSize: dynamicTypeSize,
@@ -1146,13 +1167,13 @@ private struct MarkdownInlineText: UIViewRepresentable {
     }
 }
 
-/// Completed prose shares a text view so native selection can cross paragraph and
-/// list boundaries. Rich blocks keep their specialized views; streaming keeps its
+/// Completed prose and code share a text view so native selection crosses block
+/// boundaries. Other rich blocks keep their specialized views; streaming keeps its
 /// per-block rendering until the response finishes.
-enum MarkdownProseSelection {
+enum MarkdownContinuousSelection {
     static func supports(_ block: MarkdownRenderedBlock) -> Bool {
         switch block {
-        case .paragraph, .heading:
+        case .paragraph, .heading, .codeBlock:
             return true
         case let .unorderedList(items), let .orderedList(_, items):
             return !items.isEmpty && items.allSatisfy { item in
@@ -1187,6 +1208,8 @@ enum MarkdownProseSelection {
         var firstLineIndent: CGFloat = 0
         var spacingBefore: CGFloat = 12
         var lineSpacing: CGFloat = 4
+        var copyKind: MarkdownCopyBlock.Kind = .paragraph
+        var codeCard: MarkdownCodeCard?
     }
 
     private static func paragraphs(
@@ -1204,7 +1227,14 @@ enum MarkdownProseSelection {
             case let .heading(level, inline):
                 result.append(Paragraph(
                     inline: inline, indent: indent, firstLineIndent: indent,
-                    spacingBefore: spacing + (level <= 2 ? 3 : 1), lineSpacing: 0
+                    spacingBefore: spacing + (level <= 2 ? 3 : 1), lineSpacing: 0, copyKind: .heading(level)
+                ))
+            case let .codeBlock(language, code, inline):
+                result.append(Paragraph(
+                    inline: inline, indent: indent + MarkdownCodeCard.padding,
+                    firstLineIndent: indent + MarkdownCodeCard.padding,
+                    spacingBefore: spacing, lineSpacing: 3, copyKind: .code(language: language),
+                    codeCard: MarkdownCodeCard(code: code, language: language, indent: indent)
                 ))
             case let .unorderedList(items):
                 appendList(items, start: nil, indent: indent, spacing: spacing, to: &result)
@@ -1228,6 +1258,7 @@ enum MarkdownProseSelection {
             var children = paragraphs(item.blocks, indent: indent + 32, spacing: 7)
             guard !children.isEmpty else { continue }
             children[0].prefix = start.map { "\($0 + index).\t" } ?? "•\t"
+            children[0].copyKind = .listItem(marker: start.map { "\($0 + index)." } ?? "-", depth: Int(indent / 32))
             children[0].firstLineIndent = indent
             children[0].spacingBefore = index == 0 ? spacing : 8
             result.append(contentsOf: children)
@@ -1256,6 +1287,7 @@ enum MarkdownProseSelection {
                 text.insert(NSAttributedString(string: paragraph.prefix, attributes: [
                     .font: MarkdownInlineStyle.body.uiFont(dynamicTypeSize: dynamicTypeSize),
                     .foregroundColor: foregroundColor,
+                    .markdownCopyDecoration: true,
                 ]), at: 0)
             }
             guard text.length > 0 else { continue }
@@ -1265,12 +1297,18 @@ enum MarkdownProseSelection {
             style.firstLineHeadIndent = paragraph.firstLineIndent
             style.tabStops = [NSTextTab(textAlignment: .left, location: paragraph.indent)]
             text.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: text.length))
+            paragraph.codeCard?.decorate(text)
+            text.addAttribute(.markdownCopyBlock, value: MarkdownCopyBlock(
+                paragraph.copyKind, separator: paragraph.spacingBefore < 12 ? "\n" : "\n\n"
+            ), range: NSRange(location: 0, length: text.length))
             if result.length > 0 {
-                result.append(NSAttributedString(string: "\n", attributes: result.attributes(
-                    at: result.length - 1, effectiveRange: nil
-                )))
+                var separatorAttributes = result.attributes(at: result.length - 1, effectiveRange: nil)
+                separatorAttributes.removeValue(forKey: .markdownCopyBlock)
+                separatorAttributes.removeValue(forKey: .markdownCodeCard)
+                separatorAttributes.removeValue(forKey: .attachment)
+                result.append(NSAttributedString(string: "\n", attributes: separatorAttributes))
                 let firstStyle = NSMutableParagraphStyle()
-                firstStyle.setParagraphStyle(style)
+                firstStyle.setParagraphStyle(text.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle ?? style)
                 firstStyle.paragraphSpacingBefore = paragraph.spacingBefore
                 text.addAttribute(.paragraphStyle, value: firstStyle, range: (text.string as NSString).paragraphRange(
                     for: NSRange(location: 0, length: 0)
@@ -1300,6 +1338,11 @@ enum MarkdownSelectableTextAttributes {
 
         for run in rendered.attributedText.runs {
             let intent = run.inlinePresentationIntent
+            var copyTraits: MarkdownCopyTraits = []
+            if intent?.contains(.stronglyEmphasized) == true { copyTraits.insert(.bold) }
+            if intent?.contains(.emphasized) == true { copyTraits.insert(.italic) }
+            if intent?.contains(.strikethrough) == true { copyTraits.insert(.strike) }
+            if intent?.contains(.code) == true { copyTraits.insert(.code) }
             var attributes: [NSAttributedString.Key: Any] = [
                 .font: font(
                     for: rendered.style,
@@ -1308,6 +1351,7 @@ enum MarkdownSelectableTextAttributes {
                 ),
                 .foregroundColor: foregroundColor,
                 .paragraphStyle: paragraphStyle,
+                .markdownInlineTraits: copyTraits.rawValue,
             ]
             if intent?.contains(.code) == true {
                 attributes[.backgroundColor] = T3Colors.uiSurfaceRaised
@@ -1349,6 +1393,17 @@ enum MarkdownSelectableTextAttributes {
                 )
             )
         }
+
+        let kind: MarkdownCopyBlock.Kind
+        switch rendered.style {
+        case .heading1: kind = .heading(1)
+        case .heading2: kind = .heading(2)
+        case .heading3: kind = .heading(3)
+        case .heading4: kind = .heading(4)
+        case .code: kind = .code(language: nil)
+        default: kind = .paragraph
+        }
+        result.addAttribute(.markdownCopyBlock, value: MarkdownCopyBlock(kind), range: NSRange(location: 0, length: result.length))
 
         return result
     }
