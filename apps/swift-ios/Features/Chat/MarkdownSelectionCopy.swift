@@ -156,7 +156,7 @@ enum MarkdownSelectionCopy {
     }
 
     private static func escape(_ text: String) -> String {
-        let punctuation: Set<Character> = ["\\", "`", "*", "_", "[", "]", "<", ">", "~", "|"]
+        let punctuation: Set<Character> = ["\\", "`", "*", "_", "[", "]", "<", ">", "~", "|", "&", "!"]
         let escaped = text.map { punctuation.contains($0) ? "\\" + String($0) : String($0) }.joined()
         return escaped.replacingOccurrences(of: #"(?m)^( {0,3})([#=+\-])"#, with: #"$1\\$2"#, options: .regularExpression)
             .replacingOccurrences(of: #"(?m)^( {0,3}\d+)([.)])(?=\s)"#, with: #"$1\\$2"#, options: .regularExpression)

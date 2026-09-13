@@ -832,6 +832,7 @@ private enum MarkdownTextContent: Equatable {
 }
 
 private struct MarkdownInlineText: UIViewRepresentable {
+    @SwiftUI.Environment(\.t3CodeSizeSteps) private var codeSizeSteps
     @SwiftUI.Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @SwiftUI.Environment(\.openURL) private var openURL
 
@@ -915,6 +916,7 @@ private struct MarkdownInlineText: UIViewRepresentable {
             lineSpacing: lineSpacing,
             textColor: textColor,
             dynamicTypeSize: dynamicTypeSize,
+            codeSizeSteps: codeSizeSteps,
             wrapsLines: wrapsLines,
             skills: selectionContext.skills,
             traits: textView.traitCollection
@@ -972,6 +974,7 @@ private struct MarkdownInlineText: UIViewRepresentable {
             let lineSpacing: CGFloat
             let textColor: MarkdownTextColor
             let dynamicTypeSize: DynamicTypeSize
+            let codeSizeSteps: Int
             let wrapsLines: Bool
             let skills: [FeatureProviderSkill]
             let userInterfaceStyle: UIUserInterfaceStyle
@@ -1001,6 +1004,7 @@ private struct MarkdownInlineText: UIViewRepresentable {
             lineSpacing: CGFloat,
             textColor: MarkdownTextColor,
             dynamicTypeSize: DynamicTypeSize,
+            codeSizeSteps: Int,
             wrapsLines: Bool,
             skills: [FeatureProviderSkill],
             traits: UITraitCollection
@@ -1009,6 +1013,7 @@ private struct MarkdownInlineText: UIViewRepresentable {
                 lineSpacing: lineSpacing,
                 textColor: textColor,
                 dynamicTypeSize: dynamicTypeSize,
+                codeSizeSteps: codeSizeSteps,
                 wrapsLines: wrapsLines,
                 skills: skills,
                 userInterfaceStyle: traits.userInterfaceStyle
@@ -1037,6 +1042,7 @@ private struct MarkdownInlineText: UIViewRepresentable {
                     blocks: blocks,
                     foregroundColor: textColor.uiColor,
                     dynamicTypeSize: dynamicTypeSize,
+                    codeSizeSteps: codeSizeSteps,
                     skills: skills,
                     traits: traits
                 )
@@ -1074,7 +1080,10 @@ private struct MarkdownInlineText: UIViewRepresentable {
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
                 context: nil
             )
-            let width = min(proposedWidth, max(1, ceil(bounds.width)))
+            // Code headers are subviews, so text measurement cannot reserve their width.
+            let width = (textView as? MarkdownSelectionTextView)?.hasCodeCards == true
+                ? proposedWidth
+                : min(proposedWidth, max(1, ceil(bounds.width)))
             let fittingSize = textView.sizeThatFits(
                 CGSize(width: width, height: .greatestFiniteMagnitude)
             )
@@ -1282,6 +1291,7 @@ enum MarkdownContinuousSelection {
         blocks: [MarkdownRenderedBlock],
         foregroundColor: UIColor = T3Colors.uiTextPrimary,
         dynamicTypeSize: DynamicTypeSize = .large,
+        codeSizeSteps: Int = 0,
         skills: [FeatureProviderSkill] = [],
         traits: UITraitCollection = .current
     ) -> NSAttributedString {
@@ -1291,7 +1301,9 @@ enum MarkdownContinuousSelection {
                 from: paragraph.inline,
                 lineSpacing: paragraph.lineSpacing,
                 foregroundColor: foregroundColor,
-                dynamicTypeSize: dynamicTypeSize,
+                dynamicTypeSize: paragraph.codeCard == nil
+                    ? dynamicTypeSize
+                    : dynamicTypeSize.t3Shifted(by: codeSizeSteps),
                 skills: skills,
                 traits: traits
             ))

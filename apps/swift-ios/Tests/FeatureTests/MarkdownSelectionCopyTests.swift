@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import Testing
 import UIKit
 @testable import T3Code
@@ -29,6 +30,24 @@ struct MarkdownSelectionCopyTests {
         #expect(try copy(text, selecting: "*literal*") == #"\*literal\*"#)
         let marker = try prose(#"\- this is prose"#)
         #expect(try copy(marker) == #"\- this is prose"#)
+    }
+
+    @Test(arguments: [
+        #"\&copy;"#,
+        #"\&#169;"#,
+        #"\&#xA9;"#,
+        #"&#33;[documentation](https://example.com)"#,
+        #"**\&copy;** and &#33;[**docs**](https://example.com)"#,
+    ])
+    func literalEntitiesAndLinkPrefixesSurviveCopy(_ source: String) throws {
+        let copied = try copy(prose(source))
+        #expect(MarkdownInlineFormatter.format(copied) == MarkdownInlineFormatter.format(source))
+    }
+
+    @Test func codeKeepsAmpersandsAndExclamationMarksLiteral() throws {
+        for source in ["`&copy; !`", "```text\n&copy; !\n```"] {
+            #expect(try copy(prose(source)) == source)
+        }
     }
 
     @Test func selectionAcrossHeadingAndListsContainsOnlySelectedText() throws {
@@ -163,6 +182,44 @@ struct MarkdownSelectionCopyTests {
         let header = try #require(view.subviews.first { $0.subviews.contains { ($0 as? UIButton)?.accessibilityLabel == "Copy code block" } })
         #expect(header.frame.height == MarkdownCodeCard.headerHeight)
         #expect(header.frame.width > 0)
+    }
+
+    @Test func codeSizeAdjustmentLeavesProseUnchanged() throws {
+        let document = try #require(MarkdownRenderCache.shared.documentImmediately(
+            for: MarkdownContentRevision("Prose\n\n```swift\nvalue()\n```")
+        ))
+        let normal = MarkdownContinuousSelection.attributedText(blocks: document.blocks)
+        let largerCode = MarkdownContinuousSelection.attributedText(blocks: document.blocks, codeSizeSteps: 2)
+        func font(_ text: NSAttributedString, at substring: String) throws -> UIFont {
+            let range = (text.string as NSString).range(of: substring)
+            return try #require(text.attribute(.font, at: range.location, effectiveRange: nil) as? UIFont)
+        }
+        #expect(try font(largerCode, at: "Prose") == font(normal, at: "Prose"))
+        #expect(try font(largerCode, at: "value()").pointSize > font(normal, at: "value()").pointSize)
+        #expect(try copy(largerCode) == copy(normal))
+    }
+
+    @Test(arguments: ["```swift\nx\n```", "```swift\n```"])
+    func shortCodeCardsUseAvailableSwiftUIWidth(_ source: String) throws {
+        let host = UIHostingController(rootView: MarkdownMessageView(source))
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 500))
+        window.rootViewController = host
+        window.isHidden = false
+        defer { window.isHidden = true }
+        window.layoutIfNeeded()
+        host.view.layoutIfNeeded()
+        func descendants(of view: UIView) -> [UIView] {
+            view.subviews.flatMap { [$0] + descendants(of: $0) }
+        }
+        let views = descendants(of: host.view)
+        let textView = try #require(views.compactMap { $0 as? MarkdownSelectionTextView }.first)
+        textView.layoutIfNeeded()
+        #expect(textView.bounds.width == 320)
+        let copyButton = try #require(descendants(of: textView).compactMap { $0 as? UIButton }.first)
+        let header = try #require(copyButton.superview)
+        #expect(header.bounds.contains(copyButton.frame))
+        let label = try #require(header.subviews.compactMap { $0 as? UILabel }.first)
+        #expect(label.bounds.width >= label.intrinsicContentSize.width)
     }
 
     @Test func unicodeAndEmptySelectionsAreHandled() throws {

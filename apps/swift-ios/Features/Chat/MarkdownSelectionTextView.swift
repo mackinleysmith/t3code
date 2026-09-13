@@ -61,6 +61,8 @@ final class MarkdownSelectionTextView: FeatureInlineSkillTextView {
         let header: MarkdownCodeHeaderView
     }
 
+    var hasCodeCards: Bool { !cards.isEmpty }
+
     private var cards: [CardViews] = []
     private var ownedTextStorage: NSTextStorage?
 
