@@ -5917,7 +5917,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     sizeBytes: $0.sizeBytes,
                     url: cachedAttachmentURL(for: $0.id, environmentID: environmentID)
                 )
-            }
+            },
+            updatedAt: parseDate(message.updatedAt)
         )
     }
 

@@ -514,6 +514,7 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
     public var role: FeatureMessageRole
     public var text: String
     public var createdAt: Date
+    public var updatedAt: Date?
     public var state: FeatureMessageState
     public var toolName: String?
     public var attachments: [FeatureMessageAttachment]
@@ -530,12 +531,14 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
         toolName: String? = nil,
         attachments: [FeatureMessageAttachment] = [],
         workLogImagePaths: [String]? = nil,
-        activeWorkLabel: String? = nil
+        activeWorkLabel: String? = nil,
+        updatedAt: Date? = nil
     ) {
         self.id = id
         self.role = role
         self.text = text
         self.createdAt = createdAt
+        self.updatedAt = updatedAt
         self.state = state
         self.toolName = toolName
         self.attachments = attachments

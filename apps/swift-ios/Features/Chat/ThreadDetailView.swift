@@ -2536,9 +2536,15 @@ struct FeatureMessageView: View {
                     )
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if message.state != .streaming {
-                        FeatureResponseCopyButton(text: message.text)
-                            .id(message.id)
-                            .accessibilityIdentifier("copy-response-\(message.id)")
+                        HStack(spacing: 4) {
+                            FeatureResponseCopyButton(text: message.text)
+                                .id(message.id)
+                                .accessibilityIdentifier("copy-response-\(message.id)")
+                            Text(message.updatedAt ?? message.createdAt, format: .dateTime.hour().minute())
+                                .monospacedDigit()
+                                .font(T3Typography.supporting)
+                                .foregroundStyle(T3Colors.textTertiary)
+                        }
                     }
                 }
             }
@@ -2606,8 +2612,9 @@ private struct FeatureResponseCopyButton: View {
             UIAccessibility.post(notification: .announcement, argument: "Response copied")
         } label: {
             Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
-                .font(T3Typography.control)
-                .foregroundStyle(T3Colors.textSecondary)
+                .labelStyle(.iconOnly)
+                .font(T3Typography.supporting)
+                .foregroundStyle(T3Colors.textTertiary)
                 .frame(minWidth: T3Metrics.minimumTapTarget, minHeight: T3Metrics.minimumTapTarget)
                 .contentShape(Rectangle())
         }
