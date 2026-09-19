@@ -1710,6 +1710,9 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         context.coordinator.currentOpenURL = openURL
         context.coordinator.canEditMessage = canEditMessage
         context.coordinator.onEditMessage = onEditMessage
+        context.coordinator.messageActions.editableIDs = Set(messages.lazy.filter {
+            $0.role == .user && canEditMessage($0.id)
+        }.map(\.id))
         context.coordinator.update(
             threadID: threadID,
             messages: messages,
@@ -1769,6 +1772,7 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
         private var orderedIDs: [String] = []
         private var currentThreadID: String?
         var currentOpenURL: OpenURLAction?
+        let messageActions = FeatureMessageActions()
         var canEditMessage: ((String) -> Bool)?
         var onEditMessage: ((String) -> Void)?
         private var currentImageContext: MarkdownImageContext?
@@ -1798,15 +1802,24 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
             point: CGPoint
         ) -> UIContextMenuConfiguration? {
             guard let messageID = dataSource?.itemIdentifier(for: indexPath),
-                  messagesByID[messageID]?.role == .user,
-                  canEditMessage?(messageID) == true else { return nil }
+                  let message = messagesByID[messageID],
+                  message.role == .user || message.role == .assistant else { return nil }
             return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
-                UIMenu(children: [UIAction(
-                    title: "Edit from here", image: UIImage(systemName: "arrow.uturn.backward")
-                ) { [weak self] _ in
-                    guard self?.canEditMessage?(messageID) == true else { return }
-                    self?.onEditMessage?(messageID)
-                }])
+                guard let self, let message = self.messagesByID[messageID] else { return nil }
+                var actions: [UIAction] = []
+                if !message.text.isEmpty {
+                    actions.append(UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { _ in
+                        UIPasteboard.general.string = message.text
+                        UIAccessibility.post(notification: .announcement, argument: "Message copied")
+                    })
+                }
+                if message.role == .user, self.canEditMessage?(messageID) == true {
+                    actions.append(UIAction(title: "Edit from here", image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in
+                        guard self?.canEditMessage?(messageID) == true else { return }
+                        self?.onEditMessage?(messageID)
+                    })
+                }
+                return actions.isEmpty ? nil : UIMenu(children: actions)
             }
         }
 
@@ -1849,7 +1862,12 @@ private struct FeatureTranscriptCollectionView: UIViewRepresentable {
                         message: message,
                         imageContext: self?.currentImageContext,
                         attachmentContext: self?.currentAttachmentContext,
-                        skills: self?.currentSkills ?? []
+                        skills: self?.currentSkills ?? [],
+                        messageActions: self?.messageActions,
+                        onEditMessage: { [weak self] in
+                            guard self?.canEditMessage?(messageID) == true else { return }
+                            self?.onEditMessage?(messageID)
+                        }
                     )
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .environment(\.t3CodeSizeSteps, self?.currentCodeSizeSteps ?? 0)
@@ -2921,11 +2939,18 @@ private enum FeatureAttachmentThumbnailError: Error {
     case decodingFailed
 }
 
+@MainActor @Observable
+final class FeatureMessageActions {
+    var editableIDs: Set<String> = []
+}
+
 struct FeatureMessageView: View {
     let message: FeatureMessage
     var imageContext: MarkdownImageContext? = nil
     var attachmentContext: FeatureAttachmentContext? = nil
     var skills: [FeatureProviderSkill] = []
+    var messageActions: FeatureMessageActions? = nil
+    var onEditMessage: (() -> Void)? = nil
     @SwiftUI.Environment(\.openURL) private var openURL
     @State private var previewedContext: ComposerContextRecord?
     @State private var contextUnavailable = false
@@ -3051,6 +3076,18 @@ struct FeatureMessageView: View {
                                 .monospacedDigit()
                                 .font(T3Typography.supporting)
                                 .foregroundStyle(T3Colors.textTertiary)
+                            if messageActions?.editableIDs.contains(message.id) == true {
+                                Button { onEditMessage?() } label: {
+                                    Image(systemName: "arrow.uturn.backward")
+                                        .font(T3Typography.supporting)
+                                        .foregroundStyle(T3Colors.textTertiary)
+                                        .frame(minWidth: T3Metrics.minimumTapTarget, minHeight: T3Metrics.minimumTapTarget)
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Edit from here")
+                                .accessibilityIdentifier("edit-message-\(message.id)")
+                            }
                             FeatureMessageCopyButton(text: message.text, isUserMessage: true)
                                 .id(message.id)
                                 .accessibilityIdentifier("copy-message-\(message.id)")
