@@ -9,13 +9,13 @@ import {
 import { AsyncResult } from "effect/unstable/reactivity";
 
 import type {
-  LocalEnvironmentUpdateGroup,
+  EnvironmentUpdateGroup,
   ProviderUpdateCandidate,
   ProviderUpdateRowStatus,
 } from "./ProviderUpdateLaunchNotification.logic";
 
 const testState = vi.hoisted(() => ({
-  groups: [] as LocalEnvironmentUpdateGroup[],
+  groups: [] as EnvironmentUpdateGroup[],
   updateProvider: vi.fn(),
 }));
 
@@ -95,7 +95,7 @@ vi.mock("~/state/use-atom-command", () => ({
 }));
 
 vi.mock("./ProviderUpdateLaunchNotification.environments", () => ({
-  useLocalEnvironmentUpdateGroups: () => ({
+  useEnvironmentUpdateGroups: () => ({
     groups: testState.groups,
     isAnySettling: false,
   }),

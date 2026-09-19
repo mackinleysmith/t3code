@@ -97,9 +97,8 @@ function addProviderUpdateToast(input: {
 }
 
 /**
- * The single-prompt provider update notification used when there is only one
- * local environment (no WSL backend). Non-WSL users see exactly this flow — the
- * per-environment split is gated behind WSL presence.
+ * The single-prompt provider update notification used when the primary is the
+ * user's only environment.
  */
 export function ProviderUpdatePrimaryNotification() {
   const navigate = useNavigate();
@@ -112,8 +111,8 @@ export function ProviderUpdatePrimaryNotification() {
   const { dismissedNotificationKeys, dismissNotificationKey } =
     useDismissedProviderUpdateNotificationKeys();
 
-  // If this flow unmounts (e.g. a WSL backend appears and we switch to the
-  // per-environment popover), close any prompt it owns so it does not linger.
+  // If the user adds a secondary environment and the root switches to the
+  // per-environment popover, close any prompt this flow owns.
   useEffect(() => {
     return () => {
       const activeToast = activeToastRef.current;

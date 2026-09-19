@@ -10,16 +10,16 @@ import {
 import { cn } from "~/lib/utils";
 import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { useLocalEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
+import { useEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
 import {
   collectProviderUpdateOutcomeSnapshots,
+  type EnvironmentUpdateGroup,
   firstRejectedProviderUpdateMessage,
   getProviderUpdateProgressToastView,
   getProviderUpdateSidebarPillView,
   isTerminalProviderUpdatePhase,
   resolveEnvironmentUpdateRowStatus,
-  type LocalEnvironmentUpdateGroup,
-  type LocalProviderUpdateOutcome,
+  type ProviderUpdateOutcome,
   type ProviderUpdateRowStatus,
   type ProviderUpdateRowStatusKind,
   type ProviderUpdateToastView,
@@ -34,7 +34,7 @@ type ProviderUpdateCommandResult = AtomCommandResult<
 
 /**
  * Map one targeted instance's update command result into the settled-outcome
- * shape the multi-backend reducers consume: a non-interrupted failure becomes a
+ * shape the multi-environment reducers consume: a non-interrupted failure becomes a
  * rejection carrying its message; a success carries the post-update snapshot of
  * the targeted instance (null when the backend did not report it).
  */
@@ -46,7 +46,7 @@ function toProviderUpdateOutcome(input: {
     readonly instanceId: ServerProvider["instanceId"];
   };
   readonly result: ProviderUpdateCommandResult;
-}): PromiseSettledResult<LocalProviderUpdateOutcome> {
+}): PromiseSettledResult<ProviderUpdateOutcome> {
   if (input.result._tag === "Failure") {
     if (isAtomCommandInterrupted(input.result)) {
       // An interrupted dispatch (e.g. superseded) is neither a success nor a
@@ -111,7 +111,7 @@ function EnvironmentUpdateRow({
   status,
   onUpdate,
 }: {
-  readonly group: LocalEnvironmentUpdateGroup;
+  readonly group: EnvironmentUpdateGroup;
   readonly status: ProviderUpdateRowStatus;
   readonly onUpdate: () => void;
 }) {
@@ -152,9 +152,8 @@ function EnvironmentUpdateRow({
 }
 
 /**
- * The launch popover's body when WSL is present: one row per local environment
- * (Windows + WSL), each with its own "update all" trigger that targets only
- * that environment's backend.
+ * The launch popover body for multi-environment clients. Each environment gets
+ * its own update trigger, and every command targets that environment's server.
  */
 export function ProviderUpdateEnvironmentRows({
   onInteract,
@@ -162,7 +161,7 @@ export function ProviderUpdateEnvironmentRows({
   /** Called the first time the user triggers an update, so the host can stop refreshing the prompt. */
   readonly onInteract?: () => void;
 }) {
-  const { groups } = useLocalEnvironmentUpdateGroups();
+  const { groups } = useEnvironmentUpdateGroups();
   const updateProvider = useAtomCommand(serverEnvironment.updateProvider, {
     reportFailure: false,
   });
@@ -266,9 +265,9 @@ export function ProviderUpdateEnvironmentRows({
       }, PENDING_EXPIRY_MS);
       try {
         // Dispatch each candidate's update to this environment's own backend and
-        // normalize every settled outcome into the multi-backend reducer shape.
+        // normalize every settled outcome into the multi-environment reducer shape.
         const results = await Promise.all(
-          targets.map(async (target): Promise<PromiseSettledResult<LocalProviderUpdateOutcome>> => {
+          targets.map(async (target): Promise<PromiseSettledResult<ProviderUpdateOutcome>> => {
             try {
               const result = await updateProvider({
                 environmentId,

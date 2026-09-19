@@ -3,99 +3,115 @@ import { DownloadIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useEnvironments } from "~/state/environments";
-import { isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
 import { useDismissedProviderUpdateNotificationKeys } from "../providerUpdateDismissal";
 import { ProviderUpdateEnvironmentRows } from "./ProviderUpdateEnvironmentRows";
-import { useLocalEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
+import { useEnvironmentUpdateGroups } from "./ProviderUpdateLaunchNotification.environments";
 import {
   collectProviderUpdateCandidates,
   environmentGroupsWithUpdates,
+  environmentUpdateNotificationKeys,
   getProviderUpdateInitialToastView,
-  localEnvironmentUpdateNotificationKey,
 } from "./ProviderUpdateLaunchNotification.logic";
 import { ProviderUpdatePrimaryNotification } from "./ProviderUpdatePrimaryNotification";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 
 /**
- * True when a desktop-local secondary backend (the parallel WSL backend) is
- * present alongside the primary. Local secondaries connect over loopback with a
- * `local:<backendInstanceId>` bearer connection id; everything else (SSH, relay,
- * remote) is ignored. Gating on this keeps non-WSL users on the unchanged
- * single-prompt flow.
+ * True when the catalog holds any environment besides the primary. This reads
+ * catalog presence, not connection state, so the choice of flow stays put while
+ * a remote connects, drops, or reconnects. Which environments actually appear
+ * in the popover is decided separately, per environment.
  */
-function useHasLocalSecondaryEnvironment(): boolean {
+function useHasSecondaryEnvironment(): boolean {
   const { environments } = useEnvironments();
   return useMemo(
     () =>
-      environments.some((environment) => isDesktopLocalConnectionTarget(environment.entry.target)),
+      environments.some(
+        (environment) => environment.entry.target._tag !== "PrimaryConnectionTarget",
+      ),
     [environments],
   );
 }
 
 /**
- * The provider update popover. With a WSL backend present it splits the update
- * trigger per environment; without one (the common case) it falls back to the
- * single-prompt flow so non-WSL users see no change.
+ * Split provider updates by environment when the user has any secondary
+ * environment. Single-environment users keep the simpler flow.
  */
 export function ProviderUpdateLaunchNotification() {
-  const hasLocalSecondary = useHasLocalSecondaryEnvironment();
+  const hasSecondary = useHasSecondaryEnvironment();
 
-  return hasLocalSecondary ? (
+  return hasSecondary ? (
     <ProviderUpdateEnvironmentsNotification />
   ) : (
     <ProviderUpdatePrimaryNotification />
   );
 }
 
+// Updates already offered this session, so closing the prompt through
+// "Settings" does not immediately re-open it.
 const seenProviderUpdateNotificationKeys = new Set<string>();
 type ProviderUpdateToastId = ReturnType<typeof toastManager.add>;
 
-// While a local backend (e.g. WSL) is still connecting, defer the popover so it
-// reflects every environment. Cap the wait so a stuck or failed backend can't
-// suppress the primary's updates indefinitely.
+// While a desktop-local backend such as WSL is connecting, defer the popover so
+// it reflects every environment. Remote environments join only when connected,
+// so an offline machine never consumes this grace period.
 const SETTLING_GRACE_MS = 30_000;
 
 function ProviderUpdateEnvironmentsNotification() {
   const navigate = useNavigate();
-  const { groups, isAnySettling } = useLocalEnvironmentUpdateGroups();
+  const { groups, isAnySettling } = useEnvironmentUpdateGroups();
   const { dismissedNotificationKeys, dismissNotificationKey } =
     useDismissedProviderUpdateNotificationKeys();
 
   const activeToastRef = useRef<{
     readonly toastId: ProviderUpdateToastId;
-    readonly key: string;
+    /** Every update this prompt has offered, so an unanswered close can un-see them. */
+    readonly shownKeys: Set<string>;
+    title: string;
   } | null>(null);
-  const notificationKeyRef = useRef<string | null>(null);
-  // Whether the user has triggered an update from the current toast. Until they
-  // do, the prompt is replaced when the available updates change; afterward it
-  // is kept so in-progress rows are not torn down.
+  const notificationKeysRef = useRef<ReadonlyArray<string>>([]);
+  // Whether the user has triggered an update from the current toast. Afterward
+  // the prompt is kept even when no updates remain, so its result rows survive.
   const hasInteractedRef = useRef(false);
 
-  // Close our prompt if this flow unmounts (e.g. the WSL backend is disabled
-  // and we fall back to the single-prompt flow).
-  useEffect(() => {
-    return () => {
-      if (activeToastRef.current !== null) {
-        toastManager.close(activeToastRef.current.toastId);
-        activeToastRef.current = null;
+  // Close a prompt nobody answered and forget that it was shown, so the same
+  // updates are offered again next time they are available.
+  const closeUnansweredPrompt = useCallback(() => {
+    const active = activeToastRef.current;
+    if (active === null) {
+      return;
+    }
+    if (!hasInteractedRef.current) {
+      for (const key of active.shownKeys) {
+        seenProviderUpdateNotificationKeys.delete(key);
       }
-    };
+    }
+    toastManager.close(active.toastId);
+    activeToastRef.current = null;
   }, []);
 
+  // Close our prompt if the last secondary is removed and the root falls back
+  // to the single-environment flow.
+  useEffect(() => closeUnansweredPrompt, [closeUnansweredPrompt]);
+
   const updateGroups = useMemo(() => environmentGroupsWithUpdates(groups), [groups]);
-  const notificationKey = useMemo(() => localEnvironmentUpdateNotificationKey(groups), [groups]);
+  const notificationKeys = useMemo(() => environmentUpdateNotificationKeys(groups), [groups]);
   useEffect(() => {
-    notificationKeyRef.current = notificationKey;
-  }, [notificationKey]);
+    notificationKeysRef.current = notificationKeys;
+  }, [notificationKeys]);
 
   // Title summarizes the distinct providers on offer across all environments;
   // the per-environment detail lives in the popover body.
-  const candidateUnion = useMemo(
-    () => collectProviderUpdateCandidates(updateGroups.flatMap((group) => group.candidates)),
-    [updateGroups],
-  );
+  const title = useMemo(() => {
+    const candidateUnion = collectProviderUpdateCandidates(
+      updateGroups.flatMap((group) => group.candidates),
+    );
+    return getProviderUpdateInitialToastView({
+      updateProviders: candidateUnion,
+      oneClickProviders: candidateUnion,
+    }).title;
+  }, [updateGroups]);
 
-  // Defer while any local backend is still connecting, up to the grace period.
+  // Defer while a desktop-local backend is still connecting, up to the grace period.
   const [settleGraceElapsed, setSettleGraceElapsed] = useState(false);
   useEffect(() => {
     if (!isAnySettling) {
@@ -117,53 +133,52 @@ function ProviderUpdateEnvironmentsNotification() {
   }, [navigate]);
 
   useEffect(() => {
-    // Whether a fresh prompt can actually be shown for the current update set.
-    const canShowPrompt =
-      notificationKey !== null &&
-      !isGated &&
-      !dismissedNotificationKeys.has(notificationKey) &&
-      !seenProviderUpdateNotificationKeys.has(notificationKey);
-
-    // Close a prompt the user hasn't acted on yet when the available updates
-    // change: when they clear entirely (key null) so the toast doesn't linger,
-    // and when a fresh set is ready to replace it. Keep it only while a backend
-    // is re-settling (updates still exist, just gated) — and once an update is
-    // in progress, so its rows survive.
     const active = activeToastRef.current;
-    if (
-      active &&
-      active.key !== notificationKey &&
-      !hasInteractedRef.current &&
-      (notificationKey === null || !isGated)
-    ) {
-      toastManager.close(active.toastId);
-      activeToastRef.current = null;
-    }
-
-    if (!notificationKey || !canShowPrompt || activeToastRef.current !== null) {
+    if (active !== null) {
+      if (hasInteractedRef.current) {
+        return;
+      }
+      if (notificationKeys.length === 0) {
+        closeUnansweredPrompt();
+        return;
+      }
+      // The rows render live, so an open prompt follows environments as they
+      // connect and drop without being closed and re-opened. Only the title is
+      // static, so refresh it when the set of providers on offer changes.
+      for (const key of notificationKeys) {
+        active.shownKeys.add(key);
+        seenProviderUpdateNotificationKeys.add(key);
+      }
+      if (active.title !== title) {
+        toastManager.update(active.toastId, { title });
+        active.title = title;
+      }
       return;
     }
 
-    seenProviderUpdateNotificationKeys.add(notificationKey);
+    const hasNewUpdate = notificationKeys.some(
+      (key) => !dismissedNotificationKeys.has(key) && !seenProviderUpdateNotificationKeys.has(key),
+    );
+    if (!hasNewUpdate || isGated) {
+      return;
+    }
+
+    for (const key of notificationKeys) {
+      seenProviderUpdateNotificationKeys.add(key);
+    }
     hasInteractedRef.current = false;
 
     const dismissPrompt = () => {
-      // Dismiss whatever set is still on offer at close time, so the popover
-      // does not re-pop for updates the user just declined.
-      const liveKey = notificationKeyRef.current;
-      if (liveKey) {
-        dismissNotificationKey(liveKey);
-      }
+      // Dismiss whatever is still on offer at close time, so the popover does
+      // not re-pop for updates the user just declined.
+      dismissNotificationKey(...notificationKeysRef.current);
       activeToastRef.current = null;
     };
 
     const toastId = toastManager.add(
       stackedThreadToast({
         type: "warning",
-        title: getProviderUpdateInitialToastView({
-          updateProviders: candidateUnion,
-          oneClickProviders: candidateUnion,
-        }).title,
+        title,
         description: (
           <ProviderUpdateEnvironmentRows
             onInteract={() => {
@@ -184,11 +199,12 @@ function ProviderUpdateEnvironmentsNotification() {
         },
       }),
     );
-    activeToastRef.current = { toastId, key: notificationKey };
+    activeToastRef.current = { toastId, shownKeys: new Set(notificationKeys), title };
   }, [
-    notificationKey,
+    notificationKeys,
+    title,
     isGated,
-    candidateUnion,
+    closeUnansweredPrompt,
     dismissedNotificationKeys,
     dismissNotificationKey,
     openProviderSettings,
