@@ -165,6 +165,11 @@ public actor T3Client {
         }
     }
 
+    /// Read before replacing an override entry, including changes from other clients.
+    public func serverSettings() async throws -> ServerSettingsSnapshot {
+        try await rpc.request("server.getSettings", as: ServerSettingsSnapshot.self)
+    }
+
     public func updateSettings(_ change: ServerSettingsChange) async throws
         -> ServerSettingsSnapshot
     {
@@ -262,6 +267,14 @@ public actor T3Client {
             payload: try JSONValue.encode(reference),
             as: PullRequestDetail.self
         )
+    }
+
+    public func pullRequestRouting(_ reference: PullRequestRef) async throws -> PullRequestRoutingIdentity {
+        try await rpc.request(RPCMethod.pullRequestsRouting.rawValue, payload: try JSONValue.encode(reference), as: PullRequestRoutingIdentity.self)
+    }
+
+    public func pullRequestRoutingIdentity(host: String) async throws -> PullRequestRoutingIdentity {
+        try await rpc.request(RPCMethod.pullRequestsRoutingIdentity.rawValue, payload: .object(["host": .string(host)]), as: PullRequestRoutingIdentity.self)
     }
 
     public func pullRequestActivity(_ reference: PullRequestRef) async throws
@@ -611,35 +624,6 @@ public actor T3Client {
         try await api.revokeOtherClientSessions(for: environment).revokedCount
     }
 
-    /// HTTP live-sync fallback. Each iteration is an independent request, so a
-    /// transient network loss naturally reconnects without replaying commands.
-    public func pollShell(
-        every interval: Duration = .seconds(2)
-    ) -> AsyncThrowingStream<OrchestrationShellSnapshot, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                var lastSequence: Int?
-                while !Task.isCancelled {
-                    do {
-                        let snapshot = try await self.shellSnapshot()
-                        if lastSequence != snapshot.snapshotSequence {
-                            lastSequence = snapshot.snapshotSequence
-                            continuation.yield(snapshot)
-                        }
-                    } catch is CancellationError {
-                        break
-                    } catch {
-                        // Keep retrying transient HTTP failures. Authentication
-                        // failures surface from direct loads and pairing UI.
-                    }
-                    try? await Task.sleep(for: interval)
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { @Sendable _ in task.cancel() }
-        }
-    }
-
     public func shellEventBatches(
         after sequence: Int? = nil,
         reconnect: Bool = true
@@ -654,18 +638,18 @@ public actor T3Client {
         )
     }
 
-    public func threadEvents(
+    public func threadEventBatches(
         threadID: String,
         after sequence: Int? = nil,
         turnLimit: Int? = nil
-    ) async throws -> (events: AsyncThrowingStream<ThreadStreamItem, Error>, connectionID: UUID) {
+    ) async throws -> (events: AsyncThrowingStream<[ThreadStreamItem], Error>, connectionID: UUID) {
         var payload: [String: JSONValue] = [
             "threadId": .string(threadID),
             "requestCompletionMarker": .bool(true),
         ]
         if let sequence { payload["afterSequence"] = .number(Double(sequence)) }
         if let turnLimit { payload["turnLimit"] = .number(Double(turnLimit)) }
-        return try await rpc.subscribeOnCurrentConnection(
+        return try await rpc.subscribeBatchesOnCurrentConnection(
             RPCMethod.subscribeThread.rawValue,
             payload: .object(payload),
             as: ThreadStreamItem.self
@@ -694,20 +678,26 @@ public actor T3Client {
         interactionMode: InteractionMode = .default,
         model: ModelSelection? = nil,
         attachments: [UploadChatImageAttachment] = [],
+        context: OrchestrationMessageContext? = nil,
         commandID: String = UUID().uuidString,
         messageID: String = UUID().uuidString,
         createdAt: String = OrchestrationCommands.now()
     ) async throws -> DispatchResult {
         let uploadedAttachments = try await prepareTurnAttachments(attachments)
+        let preparedMessage = Self.prepareMessageContext(
+            text: text, context: context, attachments: attachments, uploadedAttachments: uploadedAttachments,
+            supportsContext: (latestServerEnvironment ?? environment.descriptor)?.capabilities.inlineMessageContext == true
+        )
         return try await dispatch(
             try OrchestrationCommands.sendTurn(
                 threadID: threadID,
-                text: text,
+                text: preparedMessage.text,
                 runtimeMode: runtimeMode,
                 interactionMode: interactionMode,
                 model: model,
                 attachments: attachments,
                 uploadedAttachments: uploadedAttachments,
+                context: preparedMessage.context,
                 commandID: commandID,
                 messageID: messageID,
                 createdAt: createdAt
@@ -755,17 +745,22 @@ public actor T3Client {
         worktreePath: String? = nil,
         worktreePreparation: ThreadWorktreePreparation? = nil,
         attachments: [UploadChatImageAttachment] = [],
+        context: OrchestrationMessageContext? = nil,
         commandID: String = UUID().uuidString,
         messageID: String = UUID().uuidString,
         createdAt: String = OrchestrationCommands.now()
     ) async throws -> DispatchResult {
         let uploadedAttachments = try await prepareTurnAttachments(attachments)
+        let preparedMessage = Self.prepareMessageContext(
+            text: text, context: context, attachments: attachments, uploadedAttachments: uploadedAttachments,
+            supportsContext: (latestServerEnvironment ?? environment.descriptor)?.capabilities.inlineMessageContext == true
+        )
         return try await dispatchOverWebSocket(
             try OrchestrationCommands.createThreadAndSend(
                 threadID: threadID,
                 projectID: projectID,
                 title: title,
-                text: text,
+                text: preparedMessage.text,
                 model: model,
                 runtimeMode: runtimeMode,
                 interactionMode: interactionMode,
@@ -774,17 +769,23 @@ public actor T3Client {
                 worktreePreparation: worktreePreparation,
                 attachments: attachments,
                 uploadedAttachments: uploadedAttachments,
+                context: preparedMessage.context,
                 commandID: commandID,
                 messageID: messageID,
                 createdAt: createdAt
-            )
+            ),
+            responseDeadline: worktreePreparation == nil ? .standard : .none
         )
     }
 
-    private func dispatchOverWebSocket(_ command: JSONValue) async throws -> DispatchResult {
+    private func dispatchOverWebSocket(
+        _ command: JSONValue,
+        responseDeadline: WebSocketRPCClient.ResponseDeadline = .standard
+    ) async throws -> DispatchResult {
         try await rpc.request(
             RPCMethod.dispatchCommand.rawValue,
             payload: command,
+            responseDeadline: responseDeadline,
             as: DispatchResult.self
         )
     }
@@ -902,8 +903,34 @@ public actor T3Client {
     }
 
     @discardableResult
-    public func pin(threadID: String, pinned: Bool) async throws -> DispatchResult {
-        try await dispatch(OrchestrationCommands.pin(threadID: threadID, pinned: pinned))
+    public func pin(
+        threadID: String,
+        pinned: Bool,
+        orderKey: String? = nil
+    ) async throws -> DispatchResult {
+        try await dispatch(
+            OrchestrationCommands.pin(threadID: threadID, pinned: pinned, orderKey: orderKey)
+        )
+    }
+
+    @discardableResult
+    public func reorderPinnedThread(
+        threadID: String,
+        orderKey: String
+    ) async throws -> DispatchResult {
+        try await dispatch(
+            OrchestrationCommands.reorderPinned(threadID: threadID, orderKey: orderKey)
+        )
+    }
+
+    @discardableResult
+    public func reorderActiveThread(
+        threadID: String,
+        orderKey: String
+    ) async throws -> DispatchResult {
+        try await dispatch(
+            OrchestrationCommands.reorderActive(threadID: threadID, orderKey: orderKey)
+        )
     }
 
     @discardableResult
@@ -928,10 +955,17 @@ public actor T3Client {
 
     // MARK: Workspace files
 
-    public func listProjectEntries(cwd: String) async throws -> ProjectEntriesResult {
-        try await rpc.request(
+    public func listProjectEntries(
+        cwd: String,
+        directoryPath: String? = nil
+    ) async throws -> ProjectEntriesResult {
+        var payload: [String: JSONValue] = ["cwd": .string(cwd)]
+        if let directoryPath {
+            payload["directoryPath"] = .string(directoryPath)
+        }
+        return try await rpc.request(
             RPCMethod.projectsListEntries.rawValue,
-            payload: .object(["cwd": .string(cwd)]),
+            payload: .object(payload),
             as: ProjectEntriesResult.self
         )
     }
@@ -1046,6 +1080,39 @@ public actor T3Client {
         )
     }
 
+    static func prepareMessageContext(
+        text: String,
+        context: OrchestrationMessageContext?,
+        attachments: [UploadChatAttachment],
+        uploadedAttachments: [JSONValue]?,
+        supportsContext: Bool
+    ) -> (text: String, context: OrchestrationMessageContext?) {
+        var records = ComposerContextReferences.referenced(context, text: text)?.records ?? []
+        var prompt = text
+        if supportsContext {
+            for attachment in attachments where records.count < 200 {
+                guard !records.contains(where: { $0.attachment?.attachmentId == attachment.id.uuidString }) else { continue }
+                let binding = ComposerContextRecord.Attachment(
+                    attachmentId: attachment.id.uuidString, name: attachment.name,
+                    mimeType: attachment.mimeType, sizeBytes: attachment.sizeBytes
+                )
+                let record = ComposerContextRecord(
+                    contextId: "\(attachment.type)_\(attachment.id.uuidString)", label: attachment.name,
+                    payload: attachment.type == "image" ? .image(binding) : .file(binding)
+                )
+                records.append(record)
+                prompt = ComposerContextReferences.ensureReferences(prompt, records: [record])
+            }
+        }
+        let ids = Dictionary(zip(attachments, uploadedAttachments ?? []).compactMap { attachment, uploaded in
+            uploaded["id"]?.stringValue.map { (attachment.id.uuidString, $0) }
+        }, uniquingKeysWith: { first, _ in first })
+        let rebound = ComposerContextReferences.rebind(records.isEmpty ? nil : OrchestrationMessageContext(records: records), attachmentIDs: ids)
+        return supportsContext
+            ? (prompt, rebound)
+            : (ComposerContextReferences.providerProjection(prompt, context: rebound), nil)
+    }
+
     private func prepareTurnAttachments(
         _ attachments: [UploadChatImageAttachment]
     ) async throws -> [JSONValue]? {
@@ -1142,7 +1209,7 @@ public actor T3Client {
                 throw RPCError.protocolViolation("The attachment upload URL is invalid.")
             }
             switch attachment.source {
-            case let .imageData(data):
+            case let .imageData(data), let .fileData(data):
                 try await api.uploadAttachment(data, mimeType: attachment.mimeType, to: url)
             case let .file(fileURL):
                 guard let actualBytes = try? fileURL.resourceValues(
@@ -1946,6 +2013,8 @@ public enum RPCMethod: String, Sendable {
     case serverGetUsageSummary = "server.getUsageSummary"
     case pullRequestsList = "pullRequests.list"
     case pullRequestsDetail = "pullRequests.detail"
+    case pullRequestsRouting = "pullRequests.routing"
+    case pullRequestsRoutingIdentity = "pullRequests.routingIdentity"
     case pullRequestsActivity = "pullRequests.activity"
     case pullRequestsRunAction = "pullRequests.runAction"
     case pullRequestsUpdate = "pullRequests.update"
@@ -2001,6 +2070,22 @@ public enum RPCMethod: String, Sendable {
 }
 
 public enum OrchestrationCommands {
+    /// A distinct command makes older servers reject this action without restoring files.
+    public static func revertConversation(
+        threadID: String,
+        turnCount: Int,
+        commandID: String = UUID().uuidString,
+        createdAt: String = now()
+    ) -> JSONValue {
+        .object([
+            "type": .string("thread.conversation.revert"),
+            "commandId": .string(commandID),
+            "threadId": .string(threadID),
+            "turnCount": .number(Double(turnCount)),
+            "createdAt": .string(createdAt),
+        ])
+    }
+
     public static func createThread(
         threadID: String = UUID().uuidString,
         projectID: String,
@@ -2062,20 +2147,21 @@ public enum OrchestrationCommands {
         model: ModelSelection? = nil,
         attachments: [UploadChatImageAttachment] = [],
         uploadedAttachments: [JSONValue]? = nil,
+        context: OrchestrationMessageContext? = nil,
         commandID: String = UUID().uuidString,
         messageID: String = UUID().uuidString,
         createdAt: String = now()
     ) throws -> JSONValue {
+        var message: [String: JSONValue] = [
+            "messageId": .string(messageID), "role": .string("user"), "text": .string(text),
+            "attachments": .array(uploadedAttachments ?? attachments.map(\.jsonValue)),
+        ]
+        if let context { message["context"] = try .encode(context) }
         var command: [String: JSONValue] = [
             "type": .string("thread.turn.start"),
             "commandId": .string(commandID),
             "threadId": .string(threadID),
-            "message": .object([
-                "messageId": .string(messageID),
-                "role": .string("user"),
-                "text": .string(text),
-                "attachments": .array(uploadedAttachments ?? attachments.map(\.jsonValue)),
-            ]),
+            "message": .object(message),
             "runtimeMode": .string(runtimeMode.rawValue),
             "interactionMode": .string(interactionMode.rawValue),
             "createdAt": .string(createdAt),
@@ -2099,6 +2185,7 @@ public enum OrchestrationCommands {
         worktreePreparation: ThreadWorktreePreparation? = nil,
         attachments: [UploadChatImageAttachment] = [],
         uploadedAttachments: [JSONValue]? = nil,
+        context: OrchestrationMessageContext? = nil,
         commandID: String = UUID().uuidString,
         messageID: String = UUID().uuidString,
         createdAt: String = now()
@@ -2127,16 +2214,16 @@ public enum OrchestrationCommands {
             bootstrap["prepareWorktree"] = .object(prepareWorktree)
             bootstrap["runSetupScript"] = .bool(true)
         }
+        var message: [String: JSONValue] = [
+            "messageId": .string(messageID), "role": .string("user"), "text": .string(text),
+            "attachments": .array(uploadedAttachments ?? attachments.map(\.jsonValue)),
+        ]
+        if let context { message["context"] = try .encode(context) }
         return .object([
             "type": .string("thread.turn.start"),
             "commandId": .string(commandID),
             "threadId": .string(threadID),
-            "message": .object([
-                "messageId": .string(messageID),
-                "role": .string("user"),
-                "text": .string(text),
-                "attachments": .array(uploadedAttachments ?? attachments.map(\.jsonValue)),
-            ]),
+            "message": .object(message),
             "modelSelection": try .encode(model),
             "titleSeed": .string(title),
             "runtimeMode": .string(runtimeMode.rawValue),
@@ -2307,13 +2394,56 @@ public enum OrchestrationCommands {
     public static func pin(
         threadID: String,
         pinned: Bool,
+        orderKey: String? = nil,
         commandID: String = UUID().uuidString
     ) -> JSONValue {
-        basic(
-            type: pinned ? "thread.pin" : "thread.unpin",
-            threadID: threadID,
-            commandID: commandID
-        )
+        guard pinned, let orderKey else {
+            return basic(
+                type: pinned ? "thread.pin" : "thread.unpin",
+                threadID: threadID,
+                commandID: commandID
+            )
+        }
+        return .object([
+            "type": .string("thread.pin"),
+            "commandId": .string(commandID),
+            "threadId": .string(threadID),
+            "orderKey": .string(orderKey),
+        ])
+    }
+
+    /// Fractional-index reorder: pinned threads sort by `pinOrderKey`, so a
+    /// move writes one key on one thread (see `thread.pin.reorder` in
+    /// packages/contracts). `thread.active.reorder` does the same for the
+    /// active section's `activeOrderKey`.
+    public static func reorderPinned(
+        threadID: String,
+        orderKey: String,
+        commandID: String = UUID().uuidString
+    ) -> JSONValue {
+        reorder(type: "thread.pin.reorder", threadID: threadID, orderKey: orderKey, commandID: commandID)
+    }
+
+    public static func reorderActive(
+        threadID: String,
+        orderKey: String,
+        commandID: String = UUID().uuidString
+    ) -> JSONValue {
+        reorder(type: "thread.active.reorder", threadID: threadID, orderKey: orderKey, commandID: commandID)
+    }
+
+    private static func reorder(
+        type: String,
+        threadID: String,
+        orderKey: String,
+        commandID: String
+    ) -> JSONValue {
+        .object([
+            "type": .string(type),
+            "commandId": .string(commandID),
+            "threadId": .string(threadID),
+            "orderKey": .string(orderKey),
+        ])
     }
 
     public static func setRuntimeMode(

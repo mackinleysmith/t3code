@@ -25,7 +25,7 @@ private struct T3ConnectManagedCleanupError: LocalizedError {
 @MainActor
 final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     FeatureProjectCreationClient, FeatureWorkspaceAssetResolving, FeatureAttachmentAssetResolving,
-    FeatureFeedbackSubmitting, T3ConnectCapable
+    FeatureFeedbackSubmitting, FeatureContextAttachmentResolving, T3ConnectCapable
 {
     private static let maximumRetainedThreadDetails = 6
     private static let t3ConnectLogger = Logger(
@@ -43,6 +43,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private let t3ConnectDeviceManager: any T3ConnectDeviceManaging
     private let hasMatchingT3ConnectController: Bool
     private let settingsStore: UserDefaults
+    private static let gitHubRoutingKey = "swift-ios.github-routing.v1"
+    private var routedPullRequests: [FeaturePullRequestTarget: Set<String>] = [:]
+    private var cachedSettings: FeatureSettings?
     private let projectFaviconStore: FeatureProjectFaviconStore
     private let fallbackPollingInitialDelay: Duration
     private let fallbackPollingInterval: Duration
@@ -81,6 +84,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     private var latestServerConfig: ServerConfigSnapshot?
     private var serverConfigsByEnvironmentID: [String: ServerConfigSnapshot] = [:]
     private var latestSnapshot: FeatureSnapshot?
+    /// One reorder at a time: a second move planned from the same keys would
+    /// land a conflicting write (React Native holds a pending order for this).
+    private var threadMoveInFlight = false
     private var activeThreadID: String?
     private var activeThreadEnvironmentID: String?
     private var latestDetails: [String: FeatureThreadDetail] = [:]
@@ -96,6 +102,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ] = [:]
     private var pendingBootstrapSubmissions: [PendingBootstrapSubmission] = []
     private var pendingTurnSubmissions: [String: PendingTurnSubmission] = [:]
+    private var projectSettingsWriteTask: Task<Void, Error>?
+    private var projectSettingsWriteGeneration: UInt64 = 0
     private var approvalRoutes: [String: PendingRequestRoute] = [:]
     private var inputRoutes: [String: PendingRequestRoute] = [:]
     private var relayDeviceSessionIDs: Set<String> = []
@@ -240,17 +248,19 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         reconcileEnvironmentLoads(loads, savedEnvironments: environments)
         latestShell = shellsByEnvironmentID[environment.id]
         startPolling(activeClient)
-        let activeIsReachable = loads.contains {
-            $0.environment.id == environment.id && $0.shell != nil
-        }
+        let activeLoad = loads.first { $0.environment.id == environment.id }
+        let activeIsReachable = activeLoad?.shell != nil
         if activeIsReachable {
             scheduleArchivedRefresh(client: activeClient, environment: environment)
+        }
+        if activeLoad?.credentialRejected == true {
+            markActiveEnvironmentNeedsPairing()
         }
         let snapshot = makeSnapshot(
             environments: environments,
             activeEnvironment: environment,
-            connectionState: activeIsReachable ? .connected : .disconnected,
-            connectionDetail: activeIsReachable ? nil : "That server is currently unreachable."
+            connectionState: environmentConnectionStates[environment.id] ?? .disconnected,
+            connectionDetail: environmentConnectionDetails[environment.id]
         )
         latestSnapshot = snapshot
         return snapshot
@@ -305,14 +315,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
 
         reconcileEnvironmentLoads(loads, savedEnvironments: environments)
-        let activeIsReachable = loads.contains {
-            $0.environment.id == environment.id && $0.shell != nil
-        }
         let snapshot = makeSnapshot(
             environments: environments,
             activeEnvironment: environment,
-            connectionState: activeIsReachable ? .connected : .disconnected,
-            connectionDetail: activeIsReachable ? nil : "That server is currently unreachable."
+            connectionState: environmentConnectionStates[environment.id] ?? .disconnected,
+            connectionDetail: environmentConnectionDetails[environment.id]
         )
         latestSnapshot = snapshot
         return snapshot
@@ -482,6 +489,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             try await runtime.revokeCredential(id: id)
         }
         try await runtime.remove(id: id)
+        saveGitHubRoutingGrants(gitHubRoutingGrants.filter { $0.environmentID != id })
         if removesActiveEnvironment {
             await clearActiveEnvironment(disconnectClient: false)
         }
@@ -489,10 +497,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func disconnect() async {
         await clearActiveEnvironment()
-    }
-
-    func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage] {
-        try await usageSummaries(input, refreshPricing: false)
     }
 
     func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage] {
@@ -708,30 +712,134 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
+    private var gitHubRoutingGrants: [GitHubRoutingGrant] {
+        guard let data = settingsStore.data(forKey: Self.gitHubRoutingKey) else { return [] }
+        return (try? JSONDecoder().decode([GitHubRoutingGrant].self, from: data)) ?? []
+    }
+
+    private func saveGitHubRoutingGrants(_ grants: [GitHubRoutingGrant]) {
+        settingsStore.set(try? JSONEncoder().encode(grants), forKey: Self.gitHubRoutingKey)
+    }
+
+    func gitHubRoutingPermission(environmentID: String) async throws -> GitHubRoutingPermission {
+        guard let environment = try await runtime.environments().first(where: { $0.id == environmentID }) else {
+            throw NativeFeatureClientError.environmentNotFound
+        }
+        return GitHubRoutingGrant.permission(for: environment, grants: gitHubRoutingGrants)
+    }
+
+    func setGitHubRoutingPermission(environmentID: String, permission: GitHubRoutingPermission) async throws {
+        guard let environment = try await runtime.environments().first(where: { $0.id == environmentID }),
+              let key = GitHubRoutingGrant.connectionKey(environment) else {
+            throw NativeFeatureClientError.environmentNotFound
+        }
+        var grants = gitHubRoutingGrants.filter { $0.environmentID != environmentID }
+        if permission != .off {
+            grants.append(GitHubRoutingGrant(environmentID: environmentID, connectionKey: key, permission: permission))
+        }
+        saveGitHubRoutingGrants(grants)
+    }
+
+    private func routingAllowed(origin: Environment, destination: Environment, write: Bool) async -> Bool {
+        guard let current = try? await runtime.environments(),
+              let source = current.first(where: { $0.id == origin.id }),
+              let target = current.first(where: { $0.id == destination.id }),
+              GitHubRoutingGrant.connectionKey(source) == GitHubRoutingGrant.connectionKey(origin),
+              GitHubRoutingGrant.connectionKey(target) == GitHubRoutingGrant.connectionKey(destination) else { return false }
+        return GitHubRoutingGrant.allowed(origin: source, destination: target, grants: gitHubRoutingGrants, write: write)
+    }
+
+    /// Only verified GitHub accounts can route. A dispatched write is never retried elsewhere.
+    private func withPullRequestRoute<Result>(
+        _ target: FeaturePullRequestTarget, write: Bool = false, allowStaleFallback: Bool = false,
+        operation: (T3Client, PullRequestRef, PullRequestRoutingIdentity?) async throws -> Result
+    ) async throws -> Result {
+        let client = try await projectCreationClient(environmentID: target.environmentID)
+        let environments = try await runtime.environments()
+        let origin = client.environment
+        let alternatives = environments.filter {
+            GitHubRoutingGrant.allowed(origin: origin, destination: $0, grants: gitHubRoutingGrants, write: write)
+                && environmentConnectionStates[$0.id] == .connected
+        }.sorted { left, right in
+            let localHosts = ["localhost", "127.0.0.1", "::1"]
+            let leftLocal = localHosts.contains(left.httpBaseURL.host ?? "")
+            let rightLocal = localHosts.contains(right.httpBaseURL.host ?? "")
+            return leftLocal == rightLocal ? left.id < right.id : leftLocal
+        }
+        guard !alternatives.isEmpty,
+              let identity = try? await client.pullRequestRouting(target.reference),
+              identity.provider == .github else {
+            try Task.checkCancellation()
+            return try await operation(client, target.reference, nil)
+        }
+        let reference = PullRequestRef(projectId: target.reference.projectId,
+                                       repository: target.reference.repository, number: target.reference.number,
+                                       host: identity.host, expectedAccountId: identity.accountId,
+                                       allowStale: write ? target.reference.allowStale : false)
+        for environment in alternatives {
+            try Task.checkCancellation()
+            guard await routingAllowed(origin: origin, destination: environment, write: write) else { continue }
+            guard let alternate = try? await projectCreationClient(environmentID: environment.id),
+                  GitHubRoutingGrant.connectionKey(alternate.environment) == GitHubRoutingGrant.connectionKey(environment),
+                  let account = try? await alternate.pullRequestRoutingIdentity(host: identity.host),
+                  account.provider == .github, account.accountId == identity.accountId,
+                  account.host.caseInsensitiveCompare(identity.host) == .orderedSame,
+                  await routingAllowed(origin: origin, destination: environment, write: write) else { continue }
+            do {
+                let result = try await operation(alternate, reference, identity)
+                if routedPullRequests.count >= 256 { routedPullRequests.removeAll(keepingCapacity: true) }
+                routedPullRequests[target, default: []].insert(environment.id)
+                if write { try? await invalidatePullRequests(target) }
+                return result
+            } catch {
+                if write || Task.isCancelled { throw error }
+            }
+        }
+        try Task.checkCancellation()
+        do {
+            let result = try await operation(client, reference, identity)
+            if write { try? await invalidatePullRequests(target) }
+            return result
+        } catch {
+            try Task.checkCancellation()
+            guard allowStaleFallback, !write, target.reference.allowStale != false else { throw error }
+            return try await operation(client, target.reference, nil)
+        }
+    }
+
     func pullRequestDetail(_ target: FeaturePullRequestTarget) async throws -> PullRequestDetail {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .pullRequestDetail(target.reference)
+        try await withPullRequestRoute(target, allowStaleFallback: true) { client, reference, identity in
+            var detail = try await client.pullRequestDetail(reference)
+            detail.projectId = target.reference.projectId
+            if let title = identity?.projectTitle { detail.projectTitle = title }
+            if let root = identity?.workspaceRoot { detail.workspaceRoot = root }
+            return detail
+        }
     }
 
     func pullRequestActivity(_ target: FeaturePullRequestTarget) async throws
         -> PullRequestActivity
     {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .pullRequestActivity(target.reference)
+        try await withPullRequestRoute(target) { client, reference, _ in
+            try await client.pullRequestActivity(reference)
+        }
     }
 
     func pullRequestDiff(_ target: FeaturePullRequestTarget, cursor: String?) async throws
         -> PullRequestDiffResult
     {
-        try await projectCreationClient(environmentID: target.environmentID).pullRequestDiff(
-            PullRequestDiffInput(
-                projectId: target.reference.projectId,
-                repository: target.reference.repository,
-                number: target.reference.number,
+        try await withPullRequestRoute(target) { client, reference, _ in
+            try await client.pullRequestDiff(PullRequestDiffInput(
+                projectId: reference.projectId,
+                repository: reference.repository,
+                number: reference.number,
                 cursor: cursor,
-                commit: nil
-            )
-        )
+                commit: nil,
+                host: reference.host,
+                expectedAccountId: reference.expectedAccountId,
+                allowStale: reference.allowStale
+            ))
+        }
     }
 
     func runPullRequestAction(
@@ -740,12 +848,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         mergeMethod: PullRequestMergeMethod?,
         updateMethod: PullRequestUpdateMethod?
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID).runPullRequestAction(
-            target.reference,
-            action: action,
-            mergeMethod: mergeMethod,
-            updateMethod: updateMethod
-        )
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.runPullRequestAction(reference, action: action, mergeMethod: mergeMethod, updateMethod: updateMethod)
+        }
     }
 
     func updatePullRequest(
@@ -753,16 +858,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         title: String?,
         body: String?
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID).updatePullRequest(
-            target.reference,
-            title: title,
-            body: body
-        )
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.updatePullRequest(reference, title: title, body: body)
+        }
     }
 
     func commentOnPullRequest(_ target: FeaturePullRequestTarget, body: String) async throws {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .commentOnPullRequest(target.reference, body: body)
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.commentOnPullRequest(reference, body: body)
+        }
     }
 
     func submitPullRequestReview(
@@ -771,13 +875,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         body: String,
         comments: [PullRequestReviewCommentDraft]
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .submitPullRequestReview(
-                target.reference,
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.submitPullRequestReview(
+                reference,
                 verdict: verdict,
                 body: body,
                 comments: comments
             )
+        }
     }
 
     func replyToPullRequestThread(
@@ -785,8 +890,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         threadID: String,
         body: String
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .replyToPullRequestThread(target.reference, threadID: threadID, body: body)
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.replyToPullRequestThread(reference, threadID: threadID, body: body)
+        }
     }
 
     func setPullRequestThreadResolved(
@@ -794,12 +900,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         threadID: String,
         resolved: Bool
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .setPullRequestThreadResolved(
-                target.reference,
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.setPullRequestThreadResolved(
+                reference,
                 threadID: threadID,
                 resolved: resolved
             )
+        }
     }
 
     func setPullRequestReaction(
@@ -808,20 +915,22 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         content: PullRequestReactionContent,
         reacted: Bool
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .setPullRequestReaction(
-                target.reference,
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.setPullRequestReaction(
+                reference,
                 subjectID: subjectID,
                 content: content,
                 reacted: reacted
             )
+        }
     }
 
     func pullRequestReviewerCandidates(_ target: FeaturePullRequestTarget) async throws
         -> PullRequestReviewerCandidateList
     {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .pullRequestReviewerCandidates(target.reference)
+        try await withPullRequestRoute(target) { client, reference, _ in
+            try await client.pullRequestReviewerCandidates(reference)
+        }
     }
 
     func requestPullRequestReviewers(
@@ -829,18 +938,27 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         reviewers: [PullRequestReviewerCandidate],
         requested: Bool
     ) async throws {
-        try await projectCreationClient(environmentID: target.environmentID)
-            .requestPullRequestReviewers(
-                target.reference,
+        try await withPullRequestRoute(target, write: true) { client, reference, _ in
+            try await client.requestPullRequestReviewers(
+                reference,
                 reviewers: reviewers,
                 requested: requested
             )
+        }
     }
 
     func invalidatePullRequests(_ target: FeaturePullRequestTarget?) async throws {
         if let target {
             try await projectCreationClient(environmentID: target.environmentID)
                 .invalidatePullRequests(target.reference)
+            let environments = try await runtime.environments()
+            if let origin = environments.first(where: { $0.id == target.environmentID }) {
+                for id in routedPullRequests[target] ?? [] {
+                    guard let destination = environments.first(where: { $0.id == id }),
+                          await routingAllowed(origin: origin, destination: destination, write: false) else { continue }
+                    try? await projectCreationClient(environmentID: id).invalidatePullRequests(target.reference)
+                }
+            }
             return
         }
         let environments = try await runtime.environments().filter(\.isEnabled)
@@ -1136,34 +1254,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         destinationPath: String
     ) async throws -> SourceControlCloneResult {
         let client = try await projectCreationClient(environmentID: environmentID)
-        do {
-            return try await client.cloneRepository(
-                remoteURL: remoteURL,
-                destinationPath: destinationPath
-            )
-        } catch let error as RPCError {
-            switch error {
-            case .connectionUnavailable, .disconnected, .responseTimedOut:
-                // The clone RPC is not receipt-bearing, so a lost reply is
-                // ambiguous. Confirm the requested destination became a Git
-                // repository with a primary remote before moving on to the
-                // independently retryable project-registration step.
-                if let refs = try? await client.listVCSRefs(
-                    cwd: destinationPath,
-                    refresh: true,
-                    limit: 1
-                ), refs.isRepo, refs.hasPrimaryRemote {
-                    return SourceControlCloneResult(
-                        cwd: destinationPath,
-                        remoteUrl: remoteURL,
-                        repository: nil
-                    )
-                }
-                throw error
-            case .remote, .protocolViolation:
-                throw error
-            }
-        }
+        // An existing repository does not prove this clone succeeded. A lost
+        // reply must remain an error until the server confirms the destination.
+        return try await client.cloneRepository(remoteURL: remoteURL, destinationPath: destinationPath)
     }
 
     private func createProject(client: T3Client, path: String) async throws {
@@ -1381,61 +1474,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         selection: FeatureSelection?,
         runtimeMode: FeatureRuntimeMode,
         interactionMode: FeatureInteractionMode,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread {
-        try await createThreadAndSend(
-            projectID: projectID,
-            prompt: prompt,
-            selection: selection,
-            runtimeMode: runtimeMode,
-            interactionMode: interactionMode,
-            workspaceMode: .local,
-            branch: nil,
-            worktreePath: nil,
-            startFromOrigin: false,
-            attachments: attachments
-        )
-    }
-
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
-        workspaceMode: FeatureWorkspaceMode,
-        branch: String?,
-        worktreePath: String?,
-        startFromOrigin: Bool,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread {
-        try await createThreadAndSendResolved(
-            projectID: projectID,
-            prompt: prompt,
-            selection: selection,
-            runtimeMode: runtimeMode,
-            interactionMode: interactionMode,
-            workspaceMode: workspaceMode,
-            branch: branch,
-            worktreePath: worktreePath,
-            startFromOrigin: startFromOrigin,
-            attachments: attachments,
-            submissionIdentity: nil
-        )
-    }
-
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
         workspaceMode: FeatureWorkspaceMode,
         branch: String?,
         worktreePath: String?,
         startFromOrigin: Bool,
         attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext? = nil
     ) async throws -> FeatureThread {
         try await createThreadAndSendResolved(
             projectID: projectID,
@@ -1448,7 +1493,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             worktreePath: worktreePath,
             startFromOrigin: startFromOrigin,
             attachments: attachments,
-            submissionIdentity: identity
+            submissionIdentity: identity,
+            context: context
         )
     }
 
@@ -1463,7 +1509,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         worktreePath: String?,
         startFromOrigin: Bool,
         attachments: [FeatureUploadAttachment],
-        submissionIdentity: FeatureSubmissionIdentity?
+        submissionIdentity: FeatureSubmissionIdentity?,
+        context: OrchestrationMessageContext? = nil
     ) async throws -> FeatureThread {
         let route = try projectRoute(for: projectID)
         let client = route.client
@@ -1482,7 +1529,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             shell: shellsByEnvironmentID[environment.id]
         )
         let title = Self.title(from: prompt, hasAttachments: !attachments.isEmpty)
-        let uploads = try makeUploadAttachments(attachments)
+        let uploads = try await makeUploadAttachments(attachments)
         if !uploads.isEmpty { _ = try await client.serverConfig() }
         let runtime = coreRuntimeMode(runtimeMode)
         let interaction = coreInteractionMode(interactionMode)
@@ -1496,7 +1543,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: branch,
             worktreePath: worktreePath,
             startFromOrigin: startFromOrigin,
-            attachments: attachments
+            attachments: attachments,
+            context: context
         )
         let pending: PendingBootstrapSubmission
         let explicitIdentity = submissionIdentity.map { commandIdentity($0) }
@@ -1546,15 +1594,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     }
                 },
                 attachments: uploads,
+                context: context,
                 commandID: pending.identity.commandID,
                 messageID: pending.identity.messageID,
                 createdAt: pending.identity.createdAt
             )
         } catch {
             // A connection can disappear after the server accepted the command
-            // but before its reply reaches us. Bootstrap expansion creates the
-            // thread before dispatching the stable final turn, so recover an
-            // interrupted empty thread by sending only that original turn.
+            // but before its reply reaches us. Confirm the original message
+            // before recovery. An empty worktree thread can still be in setup.
             let recovered = try await recoverBootstrap(
                 client: client,
                 pending: pending,
@@ -1563,14 +1611,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 model: model,
                 runtimeMode: runtime,
                 interactionMode: interaction,
-                attachments: uploads
+                attachments: uploads,
+                context: context
             )
             guard recovered else {
-                await resetFailedBootstrapIfConfirmed(
-                    client: client,
-                    pending: pending,
-                    projectCwd: routedProject.workspaceRoot
-                )
+                if pending.worktreeBranchName == nil {
+                    await resetFailedLocalBootstrapIfConfirmed(
+                        client: client,
+                        pending: pending
+                    )
+                }
                 throw error
             }
         }
@@ -1625,7 +1675,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         model: ModelSelection,
         runtimeMode: RuntimeMode,
         interactionMode: InteractionMode,
-        attachments: [UploadChatImageAttachment]
+        attachments: [UploadChatImageAttachment],
+        context: OrchestrationMessageContext? = nil
     ) async throws -> Bool {
         guard let snapshot = try? await client.threadSnapshot(id: pending.threadID) else {
             return false
@@ -1635,6 +1686,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }) {
             return true
         }
+        // Setup and its cancellation cleanup own the worktree until the first
+        // turn is committed. Sending a bare turn can race either operation.
+        guard pending.worktreeBranchName == nil else { return false }
         guard snapshot.thread.projectId == projectID,
               snapshot.thread.deletedAt == nil,
               snapshot.thread.messages.isEmpty else {
@@ -1649,6 +1703,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 interactionMode: interactionMode,
                 model: model,
                 attachments: attachments,
+                context: context,
                 commandID: pending.identity.commandID,
                 messageID: pending.identity.messageID,
                 createdAt: pending.identity.createdAt
@@ -1665,34 +1720,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return true
     }
 
-    /// A failed bootstrap can leave its generated worktree behind after the
-    /// server rolls back the thread. Only reset the retry identity after a
-    /// fresh shell confirms the thread is absent; ambiguous network failures
-    /// keep the stable IDs so the normal recovery path remains idempotent.
-    private func resetFailedBootstrapIfConfirmed(
+    /// Reset a local retry only when a fresh shell confirms its thread is gone.
+    /// Worktree setup and cleanup stay server-owned and keep their stable IDs.
+    private func resetFailedLocalBootstrapIfConfirmed(
         client: T3Client,
-        pending: PendingBootstrapSubmission,
-        projectCwd: String
+        pending: PendingBootstrapSubmission
     ) async {
         guard let shell = try? await client.shellSnapshot(),
               !shell.threads.contains(where: { $0.id == pending.threadID }) else {
             return
-        }
-
-        if let branch = pending.worktreeBranchName,
-           let refs = try? await client.listVCSRefs(
-               cwd: projectCwd,
-               query: branch,
-               refresh: true,
-               limit: 100
-           ),
-           let path = refs.refs.first(where: {
-               $0.name == branch && $0.isRemote != true
-           })?.worktreePath {
-            // Never force-remove: setup scripts may have left useful changes.
-            // A clean orphan is safe to reclaim; a dirty one remains visible
-            // through normal worktree management.
-            try? await client.removeWorktree(cwd: projectCwd, path: path)
         }
 
         removePendingBootstrap(identity: pending.identity)
@@ -1765,8 +1801,160 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     func setThreadPinned(id: String, pinned: Bool) async throws {
         let route = try threadRoute(for: id)
-        _ = try await route.client.pin(threadID: route.wireID, pinned: pinned)
+        // Same placement as web and React Native: a fresh pin takes the top of
+        // the arranged run. Servers that predate reordering get the bare pin
+        // (keyless, sorted by creation order below keyed threads).
+        var orderKey: String? = nil
+        if pinned, cachedThread(id: route.uiID)?.supportsPinReorder == true {
+            let firstKey = latestSnapshot?.threads
+                .filter { $0.pinnedAt != nil }
+                .compactMap(\.pinOrderKey)
+                .min()
+            orderKey = ThreadOrderPlanner.orderKeyBetween(before: nil, after: firstKey)
+        }
+        _ = try await route.client.pin(threadID: route.wireID, pinned: pinned, orderKey: orderKey)
         try? await refresh(client: route.client)
+    }
+
+    /// Saves a full-section order. Cross-section moves first clear the source
+    /// lifecycle state. Every key write goes to the thread's owning server.
+    @discardableResult
+    func reorderThread(
+        id: String,
+        section: FeatureThreadOrderSection,
+        orderedIDs: [String]
+    ) async throws -> [FeatureThreadOrderAssignment] {
+        guard !threadMoveInFlight else { return [] }
+        guard let snapshot = latestSnapshot else {
+            throw NativeFeatureClientError.threadNotFound
+        }
+        // Only currently-connected environments are writable; a disconnected
+        // server's rows keep their stale keys as anchors but never receive
+        // writes, so a spread rewrite cannot half-land on a dead client.
+        let connectedEnvironmentIDs = Set(
+            snapshot.environments
+                .filter { $0.isEnabled && environmentConnectionStates[$0.id] == .connected }
+                .map(\.id)
+        )
+        let threadsByID = Dictionary(
+            snapshot.threads.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let now = Date.now
+        let canonical = DailyUXSidebarIndex.orderedSection(snapshot.threads, section: section, now: now)
+        guard let moved = threadsByID[id],
+              ThreadArrangementPlanner.canEnter(moved, section: section, now: now),
+              Set(orderedIDs).count == orderedIDs.count,
+              Set(orderedIDs) == Set(canonical.map(\.id)).union([id]),
+              let assignments = ThreadOrderPlanner.planDrop(
+            ordered: orderedIDs.compactMap { threadsByID[$0] },
+            all: snapshot.threads,
+            section: section,
+            connectedEnvironmentIDs: connectedEnvironmentIDs,
+            movedID: id
+        ) else {
+            return []
+        }
+
+        threadMoveInFlight = true
+        defer { threadMoveInFlight = false }
+
+        var confirmed: [FeatureThreadOrderAssignment] = []
+        var touchedEnvironmentIDs = Set<String>()
+        var firstError: Error?
+        let crossesSection = !canonical.contains(where: { $0.id == id })
+        if crossesSection {
+            do {
+                let route = try threadRoute(for: id)
+                touchedEnvironmentIDs.insert(route.environmentID)
+                for action in ThreadArrangementPlanner.lifecycle(moved, section: section, now: now) {
+                    switch action {
+                    case .pin:
+                        let key = assignments.first(where: { $0.threadID == id })?.orderKey
+                        _ = try await route.client.pin(threadID: route.wireID, pinned: true, orderKey: key)
+                    case .unpin:
+                        _ = try await route.client.pin(threadID: route.wireID, pinned: false)
+                    case .unsettle:
+                        _ = try await route.client.settle(threadID: route.wireID, settled: false)
+                    case .unsnooze:
+                        _ = try await route.client.snooze(threadID: route.wireID, until: nil)
+                    }
+                }
+            } catch {
+                firstError = error
+            }
+        }
+        for assignment in assignments {
+            guard firstError == nil else { break }
+            do {
+                let route = try threadRoute(for: assignment.threadID)
+                // Refresh even when the transport lost a receipt after the
+                // server accepted the write.
+                touchedEnvironmentIDs.insert(route.environmentID)
+                switch section {
+                case .pinned:
+                    _ = try await route.client.reorderPinnedThread(
+                        threadID: route.wireID,
+                        orderKey: assignment.orderKey
+                    )
+                case .active:
+                    _ = try await route.client.reorderActiveThread(
+                        threadID: route.wireID,
+                        orderKey: assignment.orderKey
+                    )
+                }
+                confirmed.append(assignment)
+            } catch {
+                // Confirmed writes stand: a later environment rejecting its
+                // write leaves the earlier arrangement in place.
+                firstError = error
+                break
+            }
+        }
+        for environmentID in touchedEnvironmentIDs {
+            if let client = environmentClients[environmentID] {
+                try? await refresh(client: client)
+            }
+        }
+        if let firstError {
+            guard confirmed.isEmpty else {
+                throw FeatureThreadMovePartialError(
+                    confirmed: confirmed,
+                    underlying: firstError
+                )
+            }
+            throw firstError
+        }
+        return confirmed
+    }
+
+    func setThreadPullRequest(id: String, url: String, linked: Bool) async throws {
+        let route = try threadRoute(for: id)
+        guard let thread = cachedThread(id: route.uiID),
+              thread.supportsMultiplePullRequests == true || thread.supportsPullRequestLinking == true else {
+            throw NativeFeatureClientError.invalidPullRequestLink
+        }
+        let existing = thread.pullRequests?.first { $0.url == url }
+        let legacyKey = thread.linkedPullRequest.flatMap { link -> ThreadPullRequestKey? in
+            guard link.url == url, let host = URL(string: link.url)?.host else { return nil }
+            return ThreadPullRequestKey(host: host, repository: link.repository, number: link.number)
+        }
+        guard let key = existing?.id ?? ThreadPullRequests.parseURL(url) ?? legacyKey else {
+            throw NativeFeatureClientError.invalidPullRequestLink
+        }
+        let project = latestSnapshot?.projects.first {
+            $0.environmentID == route.environmentID
+                && $0.repositoryIdentity.map { key.matchesRepository($0.canonicalKey) } == true
+        }
+        guard let command = ThreadPullRequests.mutation(
+            threadID: route.wireID, key: key, url: url, linked: linked,
+            multiple: thread.supportsMultiplePullRequests == true,
+            legacyProjectID: project.flatMap { projectWireIDs[$0.id] },
+            legacyRepository: key.host == "dev.azure.com" ? key.repository.components(separatedBy: "/_git/").last : nil
+        ) else { throw NativeFeatureClientError.invalidPullRequestLink }
+        _ = try await route.client.dispatch(command)
+        try? await refresh(client: route.client)
+        if activeThreadID == route.uiID { try? await refreshThread(id: route.uiID, client: route.client) }
     }
 
     func setRuntimeMode(id: String, mode: FeatureRuntimeMode) async throws {
@@ -1820,10 +2008,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         detailCacheRecency.removeAll { $0 == route.uiID }
         await emitCachedSnapshot(for: route.environmentID)
         try? await refresh(client: route.client, includeArchived: true)
-    }
-
-    func loadThread(id: String) async throws -> FeatureThreadDetail {
-        try await loadThread(id: id, fresh: false)
     }
 
     func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail {
@@ -1989,56 +2173,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func sendMessage(
         threadID: String,
         text: String,
-        selection: FeatureSelection?
-    ) async throws {
-        try await sendMessage(
-            threadID: threadID,
-            text: text,
-            selection: selection,
-            attachments: []
-        )
-    }
-
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        attachments: [FeatureUploadAttachment]
-    ) async throws {
-        try await sendMessageResolved(
-            threadID: threadID,
-            text: text,
-            selection: selection,
-            runtimeMode: nil,
-            attachments: attachments,
-            submissionIdentity: nil
-        )
-    }
-
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
-    ) async throws {
-        try await sendMessageResolved(
-            threadID: threadID,
-            text: text,
-            selection: selection,
-            runtimeMode: nil,
-            attachments: attachments,
-            submissionIdentity: identity
-        )
-    }
-
-    func sendMessage(
-        threadID: String,
-        text: String,
         selection: FeatureSelection?,
         runtimeMode: FeatureRuntimeMode,
         attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext? = nil
     ) async throws {
         try await sendMessageResolved(
             threadID: threadID,
@@ -2046,7 +2185,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             selection: selection,
             runtimeMode: runtimeMode,
             attachments: attachments,
-            submissionIdentity: identity
+            submissionIdentity: identity,
+            context: context
         )
     }
 
@@ -2056,7 +2196,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         selection: FeatureSelection?,
         runtimeMode requestedRuntimeMode: FeatureRuntimeMode?,
         attachments: [FeatureUploadAttachment],
-        submissionIdentity: FeatureSubmissionIdentity?
+        submissionIdentity: FeatureSubmissionIdentity?,
+        context: OrchestrationMessageContext? = nil
     ) async throws {
         let route = try threadRoute(for: threadID)
         let client = route.client
@@ -2067,7 +2208,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             throw NativeFeatureClientError.threadNotFound
         }
         let model = selection.map(coreModelSelection)
-        let uploads = try makeUploadAttachments(attachments)
+        let uploads = try await makeUploadAttachments(attachments)
         if !uploads.isEmpty { _ = try await client.serverConfig() }
         let runtimeMode = coreRuntimeMode(
             requestedRuntimeMode ?? mapRuntimeMode(shellThread.runtimeMode)
@@ -2078,7 +2219,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             model: model,
             runtimeMode: runtimeMode,
             interactionMode: interactionMode,
-            attachments: attachments
+            attachments: attachments,
+            context: context
         )
         let pending: PendingTurnSubmission
         let explicitIdentity = submissionIdentity.map { commandIdentity($0) }
@@ -2106,6 +2248,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 interactionMode: interactionMode,
                 model: model,
                 attachments: uploads,
+                context: context,
                 commandID: pending.identity.commandID,
                 messageID: pending.identity.messageID,
                 createdAt: pending.identity.createdAt
@@ -2158,6 +2301,156 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         try? await refresh(client: route.client)
     }
 
+    func canRewindConversation(threadID: String, messageID: String) -> Bool {
+        guard let route = try? threadRoute(for: threadID),
+              let thread = activeThreadID == route.uiID
+                ? activeRawThread : threadResumeStates[route.uiID]?.thread,
+              let provider = serverConfigsByEnvironmentID[route.environmentID]?.providers.first(where: {
+                  $0.instanceId == (thread.session?.providerInstanceId ?? thread.modelSelection.instanceId)
+              }),
+              provider.supportsConversationRollback != false,
+              provider.driver != "cursor", provider.driver != "grok" else { return false }
+        return NativeConversationRewind.turnCount(before: messageID, in: thread) != nil
+    }
+
+    func rewindConversation(
+        threadID: String, messageID: String,
+        prepareRecovery: @MainActor (FeatureRevertedMessage) async throws -> Void
+    ) async throws {
+        let route = try threadRoute(for: threadID)
+        let generation = environmentGeneration
+        // The visible page can omit checkpoints. Validate against the whole thread.
+        let snapshot = try await route.client.threadSnapshot(id: route.wireID)
+        guard let provider = serverConfigsByEnvironmentID[route.environmentID]?.providers.first(where: {
+            $0.instanceId == (snapshot.thread.session?.providerInstanceId ?? snapshot.thread.modelSelection.instanceId)
+        }), provider.supportsConversationRollback != false,
+              provider.driver != "cursor", provider.driver != "grok" else {
+            throw FeatureCapabilityUnavailable("Conversation rewind for this provider")
+        }
+        guard snapshot.thread.session?.status != "running",
+              snapshot.thread.session?.status != "starting",
+              let turnCount = NativeConversationRewind.turnCount(before: messageID, in: snapshot.thread),
+              let original = snapshot.thread.messages.first(where: { $0.id == messageID }) else {
+            throw FeatureConversationRewindError(message: "Wait for this turn to finish before rewinding.")
+        }
+        let message = mapMessage(original, environmentID: route.environmentID)
+        let fileStore = ManagedAttachmentFileStore()
+        var attachments: [FeatureDraftAttachment] = []
+        var recoveryIsStored = false
+        defer {
+            if !recoveryIsStored {
+                for attachment in attachments {
+                    if let file = attachment.ownedFile {
+                        try? fileStore.removeOwnedFile(fileName: file.fileName)
+                    }
+                }
+            }
+        }
+        // Rewind removes the old server assets, even when workspace files are kept.
+        for attachment in message.attachments {
+            let url = try await attachmentAssetURL(threadID: route.uiID, attachment: attachment)
+            let (temporaryURL, response) = try await URLSession.shared.download(from: url)
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            guard let response = response as? HTTPURLResponse,
+                  (200..<300).contains(response.statusCode) else {
+                throw FeatureConversationRewindError(message: "Could not save \(attachment.name) before rewind.")
+            }
+            let id = UUID()
+            let file = try await Task.detached {
+                try fileStore.copyOwnedFile(
+                    from: temporaryURL, attachmentID: id, originalFileName: attachment.name
+                )
+            }.value
+            attachments.append(FeatureDraftAttachment(
+                id: id, ownedFile: file, filename: attachment.name, mimeType: attachment.mimeType,
+                source: attachment.source
+            ))
+        }
+        try await prepareRecovery(FeatureRevertedMessage(message: message, attachments: attachments))
+        recoveryIsStored = true
+        let subscription: (events: AsyncThrowingStream<[ThreadStreamItem], Error>, connectionID: UUID)
+        do {
+            try Task.checkCancellation()
+            guard isKnownClient(route.client, environmentID: route.environmentID, generation: generation) else {
+                throw CancellationError()
+            }
+            subscription = try await route.client.threadEventBatches(
+                threadID: route.wireID, after: snapshot.snapshotSequence
+            )
+        } catch {
+            throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
+        }
+        // Keep events that arrive before dispatch replies. The pump owns socket
+        // cancellation even when dispatch rejects before completion tracking starts.
+        let buffered = AsyncThrowingStream<[ThreadStreamItem], Error>.makeStream(bufferingPolicy: .bufferingOldest(64))
+        let pump = Task {
+            do {
+                for try await batch in subscription.events {
+                    if case .dropped = buffered.continuation.yield(batch) {
+                        throw FeatureConversationRewindError(message: "Rewind updates fell behind. Reload the thread to check its history.")
+                    }
+                }
+                buffered.continuation.finish()
+            } catch {
+                buffered.continuation.finish(throwing: error)
+            }
+        }
+        defer {
+            pump.cancel()
+            buffered.continuation.finish()
+        }
+        do {
+            let accepted: DispatchResult
+            do {
+                accepted = try await route.client.dispatch(OrchestrationCommands.revertConversation(
+                    threadID: route.wireID, turnCount: turnCount
+                ))
+            } catch let error as RPCError {
+                if case .remote = error {
+                    throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
+                }
+                throw error
+            } catch let error as HTTPError {
+                if case let .status(code, _, _) = error, (400..<500).contains(code) {
+                    throw FeatureConversationRewindError(message: error.localizedDescription, didNotRevert: true)
+                }
+                throw error
+            }
+            let receiptSequence = try await NativeConversationRewind.waitForCompletion(
+                batches: buffered.stream,
+                threadID: route.wireID,
+                messageID: messageID,
+                turnCount: turnCount,
+                afterSequence: accepted.sequence,
+                previousFailureIDs: Set(snapshot.thread.activities.filter {
+                    $0.kind == "checkpoint.revert.failed"
+                }.map(\.id))
+            )
+            let current = try await route.client.threadSnapshot(id: route.wireID)
+            guard current.snapshotSequence >= receiptSequence,
+                  NativeConversationRewind.isComplete(current.thread, messageID: messageID, turnCount: turnCount) else {
+                throw FeatureConversationRewindError(message: "Could not confirm the final rewind state. The prompt remains saved for recovery.")
+            }
+        } catch {
+            if (error as? FeatureConversationRewindError)?.didNotRevert == true { throw error }
+            // A lost socket does not mean rollback failed. An HTTP read can
+            // confirm completion without submitting the destructive command again.
+            guard let current = try? await route.client.threadSnapshot(id: route.wireID),
+                  current.snapshotSequence > snapshot.snapshotSequence,
+                  NativeConversationRewind.isComplete(current.thread, messageID: messageID, turnCount: turnCount) else {
+                throw error
+            }
+        }
+        // Do not turn a failed refresh into a failed rewind. The receipt confirms
+        // that history changed, so the recovered prompt must still reach the draft.
+        threadResumeStates[route.uiID] = nil
+        do {
+            try await refreshThread(id: route.uiID, client: route.client)
+        } catch {
+            continuation.yield(.threadSync(id: route.uiID, state: .failed(error.localizedDescription)))
+        }
+    }
+
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws {
         guard let request = approvalRoutes[id] else {
             throw NativeFeatureClientError.approvalNotFound
@@ -2170,11 +2463,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         )
         approvalRoutes[id] = nil
         removeCachedApproval(id: id, threadID: route.uiID)
-        try? await refreshThread(id: route.uiID, client: route.client)
-    }
-
-    func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws {
-        try await resolveUserInput(id: id, answers: answers, attachmentsByQuestionID: [:])
+        await refreshThreadUnlessLive(id: route.uiID, client: route.client)
     }
 
     func resolveUserInput(
@@ -2185,15 +2474,19 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             throw NativeFeatureClientError.inputRequestNotFound
         }
         let route = try threadRoute(for: request.threadID)
+        var uploads: [String: [UploadChatAttachment]] = [:]
+        for (questionID, attachments) in attachmentsByQuestionID {
+            uploads[questionID] = try await makeUploadAttachments(attachments)
+        }
         _ = try await route.client.respondToUserInput(
             threadID: route.wireID,
             requestID: request.wireID,
             answers: answers.mapValues(\.jsonValue),
-            attachmentsByQuestionID: try attachmentsByQuestionID.mapValues(makeUploadAttachments)
+            attachmentsByQuestionID: uploads
         )
         inputRoutes[id] = nil
         removeCachedInput(id: id, threadID: route.uiID)
-        try? await refreshThread(id: route.uiID, client: route.client)
+        await refreshThreadUnlessLive(id: route.uiID, client: route.client)
     }
 
     func dismissUserInput(id: String) async throws {
@@ -2205,12 +2498,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         _ = try await route.client.dismissUserInput(threadID: route.wireID, requestID: request.wireID)
         inputRoutes[id] = nil
         removeCachedInput(id: id, threadID: route.uiID)
-        try? await refreshThread(id: route.uiID, client: route.client)
+        await refreshThreadUnlessLive(id: route.uiID, client: route.client)
     }
 
     func saveSettings(_ settings: FeatureSettings) async throws {
         let data = try JSONEncoder().encode(settings)
         settingsStore.set(data, forKey: Self.settingsKey)
+        cachedSettings = settings
         latestSnapshot?.settings = settings
     }
 
@@ -2342,6 +2636,58 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }.map { id in latestSnapshot?.environments.first { $0.id == id }?.name ?? id }
     }
 
+    func projectPreferences(projectID: String) async throws -> FeatureProjectPreferences {
+        let route = try projectRoute(for: projectID)
+        let settings = try await serverPreferences(environmentID: route.environmentID)
+        let project = try project(for: route)
+        let providers = serverConfigsByEnvironmentID[route.environmentID]?.providers ?? []
+        return FeatureProjectPreferences(
+            environment: settings,
+            effective: settings.resolvingProject(
+                id: route.wireID, legacyModelSelection: project.defaultModelSelection,
+                legacyWorkspaceMode: project.defaultThreadEnvMode,
+                disabledProviderIDs: Set(providers.filter { !providerCanRun($0) }.map(\.instanceId))
+            )
+        )
+    }
+
+    func updateProjectPreferences(projectID: String, change: ServerProjectSettingChange) async throws {
+        // Entries replace the entire project's overrides. Serialize local edits
+        // and read the latest entry only after the previous write completes.
+        let predecessor = projectSettingsWriteTask
+        let write = Task { @MainActor [self] in
+            if let predecessor { _ = try? await predecessor.value }
+            let route = try projectRoute(for: projectID)
+            let generation = environmentGeneration
+            let config = try await route.client.serverConfig()
+            guard isKnownClient(route.client, environmentID: route.environmentID, generation: generation) else {
+                throw CancellationError()
+            }
+            guard config.environment?.capabilities.projectSettingsOverrides == true else {
+                throw FeatureCapabilityUnavailable("Project preferences")
+            }
+            let settings = try await route.client.serverSettings()
+            if change.key == .responseStreamingMode, settings.responseStreamingMode == nil {
+                throw FeatureCapabilityUnavailable("Response streaming preferences")
+            }
+            if change.key == .continueThreadsAfterServerUpdate,
+               config.environment?.capabilities.threadRestartContinuation != true {
+                throw FeatureCapabilityUnavailable("Restart continuation")
+            }
+            _ = try await saveServerPreferences(
+                client: route.client, environmentID: route.environmentID,
+                change: change.patch(projectID: route.wireID, settings: settings)
+            )
+        }
+        projectSettingsWriteGeneration &+= 1
+        let generation = projectSettingsWriteGeneration
+        projectSettingsWriteTask = write
+        defer {
+            if projectSettingsWriteGeneration == generation { projectSettingsWriteTask = nil }
+        }
+        try await write.value
+    }
+
     private func supportsRestartContinuation(environmentID: String) -> Bool {
         serverConfigsByEnvironmentID[environmentID]?.environment?.capabilities.threadRestartContinuation == true
     }
@@ -2363,6 +2709,14 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
         setServerConfig(config, environmentID: environmentID)
         switch change {
+        case .responseStreamingMode:
+            guard config.settings?.responseStreamingMode != nil else {
+                throw FeatureCapabilityUnavailable("Response streaming preferences")
+            }
+        case .projectSettingsOverrides:
+            guard config.environment?.capabilities.projectSettingsOverrides == true else {
+                throw FeatureCapabilityUnavailable("Project preferences")
+            }
         case .environmentIcon:
             guard config.environment?.capabilities.environmentIcon == true else {
                 throw FeatureCapabilityUnavailable("Environment icons")
@@ -2381,7 +2735,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             supportsRestartContinuation: supportsRestartContinuation(environmentID: environmentID)
         ) else { throw FeatureCapabilityUnavailable("Restart continuation") }
         _ = try await saveServerPreferences(client: client, environmentID: environmentID, change: supportedChange)
-        if case .environmentIcon = supportedChange { return }
+        switch supportedChange {
+        case .environmentIcon, .projectSettingsOverrides, .responseStreamingMode: return
+        default: break
+        }
         await fanOutSharedPreferences(from: environmentID, change: supportedChange)
     }
 
@@ -2501,8 +2858,17 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     func listFiles(threadID: String, path: String?) async throws -> [FeatureFileEntry] {
         let route = try threadRoute(for: threadID)
         let context = try workspaceContext(route: route)
-        let result = try await route.client.listProjectEntries(cwd: context.cwd)
-        return NativeWorkspaceMapper.files(result.entries, directory: path)
+        let generation = environmentGeneration
+        let directory = NativeWorkspaceMapper.directoryPath(path, workspaceRoot: context.cwd)
+        let result = try await route.client.listProjectEntries(
+            cwd: context.cwd,
+            directoryPath: directory
+        )
+        guard isKnownClient(route.client, environmentID: route.environmentID, generation: generation),
+              try workspaceContext(route: route).cwd == context.cwd else {
+            throw CancellationError()
+        }
+        return NativeWorkspaceMapper.files(result.entries, directory: directory, workspaceRoot: context.cwd)
     }
 
     func searchProjectFiles(
@@ -3071,9 +3437,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ) async throws -> FeatureUploadedAttachmentReference? {
         let client = try await projectCreationClient(environmentID: environmentID)
         _ = try await client.serverConfig()
-        let prepared = try await client.prepareAttachment(
-            makeUploadAttachments([attachment])[0]
-        )
+        let uploads = try await makeUploadAttachments([attachment])
+        let prepared = try await client.prepareAttachment(uploads[0])
         return prepared.map {
             FeatureUploadedAttachmentReference(
                 environmentID: $0.environmentID,
@@ -3226,6 +3591,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            pullRequests: thread.pullRequests,
             branchPullRequest: thread.branchPullRequest,
             latestTurn: thread.latestTurn,
             createdAt: thread.createdAt,
@@ -3238,6 +3604,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             snoozedUntil: thread.snoozedUntil,
             snoozedAt: thread.snoozedAt,
             pinnedAt: thread.pinnedAt,
+            pinOrderKey: thread.pinOrderKey,
             session: thread.session,
             latestUserMessageAt: thread.latestUserMessageAt,
             hasPendingApprovals: thread.hasPendingApprovals,
@@ -3456,6 +3823,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 } catch is CancellationError {
                     return
                 } catch {
+                    if error.isRejectedAuthorization,
+                       let self,
+                       self.isCurrentSession(client: activeClient, generation: generation) {
+                        self.markActiveEnvironmentNeedsPairing()
+                        return
+                    }
                     // The independent HTTP fallback below keeps the workspace
                     // fresh while the socket reconnects.
                 }
@@ -3520,6 +3893,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                                   client: activeClient,
                                   generation: generation
                               ) else {
+                            return
+                        }
+                        if error.isRejectedAuthorization {
+                            self.markActiveEnvironmentNeedsPairing()
                             return
                         }
                         self.emitConnection(
@@ -3708,7 +4085,11 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     load.shell.map(Self.shellNeedsFrequentAggregateRefresh) == true
                 }
                 for load in loads {
-                    if load.shell == nil {
+                    if load.credentialRejected {
+                        // Only re-pairing changes this. Re-pairing replaces
+                        // the runtime client and restarts this loop.
+                        failureBackoffs[load.environment.id] = .seconds(24 * 60 * 60)
+                    } else if load.shell == nil {
                         failureBackoffs[load.environment.id] = failureInterval
                     } else {
                         failureBackoffs[load.environment.id] = nil
@@ -4014,7 +4395,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     guard !Task.isCancelled,
                           self?.isCurrentDetail(route, generation: streamGeneration) == true,
                           self?.environmentGeneration == sessionGeneration else { return }
-                    let subscription = try await route.client.threadEvents(
+                    let subscription = try await route.client.threadEventBatches(
                         threadID: route.wireID,
                         after: sequence,
                         turnLimit: supportsPagination ? Self.initialThreadUserTurnLimit : nil
@@ -4030,8 +4411,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                         self?.continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
                     }
                     self?.activeDetailConnectionID = subscriptionConnectionID
-                    for try await item in subscription.events {
-                        if case .synchronized = item {
+                    for try await items in subscription.events {
+                        if items.contains(where: { if case .synchronized = $0 { true } else { false } }) {
                             let connectionID = await route.client.currentConnectionID()
                             guard !Task.isCancelled, let self,
                                   self.isCurrentDetail(route, generation: streamGeneration),
@@ -4049,8 +4430,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                             self.continuation.yield(.threadSync(id: route.uiID, state: .catchingUp))
                             self.ensureDetailCatchUpFallback(route, generation: streamGeneration)
                         }
-                        self.consumeDetailStreamItem(
-                            item, route: route, subscriptionEpoch: subscriptionEpoch
+                        self.consumeDetailStreamBatch(
+                            items, route: route, subscriptionEpoch: subscriptionEpoch
                         )
                     }
                     // A thread subscription stays open until its owner leaves.
@@ -4186,10 +4567,41 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         ensureDetailCatchUpFallback(route, generation: detailStreamGeneration)
     }
 
+    private func consumeDetailStreamBatch(
+        _ items: [ThreadStreamItem],
+        route: NativeThreadRoute,
+        subscriptionEpoch: Int
+    ) {
+        // Keep snapshot replacement and page-watermark merges at their event
+        // positions. Ordinary replay batches share one legacy sync publication.
+        let previousSequence = activeThreadSequence
+        let needsIndividualUpdates = items.count == 1 || activeRawThread == nil
+            || pendingOlderThreadPage != nil || items.contains { item in
+                switch item {
+                case .snapshot: true
+                case let .event(event):
+                    event["type"]?.stringValue == "thread.reverted"
+                        || event["type"]?.stringValue == "thread.deleted"
+                case .synchronized: false
+                }
+            }
+        for item in items {
+            consumeDetailStreamItem(
+                item, route: route, subscriptionEpoch: subscriptionEpoch,
+                synchronizeLegacy: needsIndividualUpdates
+            )
+        }
+        if !needsIndividualUpdates, activeThreadSequence != previousSequence,
+           serverConfigsByEnvironmentID[route.environmentID]?.threadResumeCompletionMarker != true {
+            markDetailSynchronized(route)
+        }
+    }
+
     private func consumeDetailStreamItem(
         _ item: ThreadStreamItem,
         route: NativeThreadRoute,
-        subscriptionEpoch: Int
+        subscriptionEpoch: Int,
+        synchronizeLegacy: Bool
     ) {
         switch item {
         case .synchronized:
@@ -4260,7 +4672,8 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 scheduleDetailRefresh(threadID: route.uiID, client: route.client, force: true)
             }
         }
-        if serverConfigsByEnvironmentID[route.environmentID]?.threadResumeCompletionMarker != true {
+        if synchronizeLegacy,
+           serverConfigsByEnvironmentID[route.environmentID]?.threadResumeCompletionMarker != true {
             markDetailSynchronized(route)
         }
     }
@@ -4376,15 +4789,18 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return await withTaskGroup(of: EnvironmentShellLoad.self) { group in
             for pair in clients {
                 group.addTask {
-                    let shell = try? await pair.client.shellSnapshot(
-                        timeoutInterval: shellTimeoutInterval
-                    )
-                    guard shell != nil else {
+                    let shell: OrchestrationShellSnapshot?
+                    do {
+                        shell = try await pair.client.shellSnapshot(
+                            timeoutInterval: shellTimeoutInterval
+                        )
+                    } catch {
                         return EnvironmentShellLoad(
                             environment: pair.environment,
                             client: pair.client,
                             shell: nil,
-                            config: nil
+                            config: nil,
+                            credentialRejected: error.isRejectedAuthorization
                         )
                     }
 
@@ -4468,6 +4884,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                 }
                 environmentConnectionStates[load.environment.id] = .connected
                 environmentConnectionDetails[load.environment.id] = nil
+            } else if load.credentialRejected {
+                environmentConnectionStates[load.environment.id] = .needsPairing
+                environmentConnectionDetails[load.environment.id] = Self.needsPairingDetail
             } else {
                 environmentConnectionStates[load.environment.id] = .disconnected
                 environmentConnectionDetails[load.environment.id] =
@@ -4475,6 +4894,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             }
         }
         rebuildEntityIndexes(savedEnvironments)
+    }
+
+    static let needsPairingDetail = "This computer no longer accepts the saved pairing. Pair again."
+
+    /// A rejected credential cannot recover on its own. Stop the live
+    /// subscription and the HTTP fallback so the app is not minting tickets
+    /// and polling a 401 every few seconds until the user pairs again.
+    private func markActiveEnvironmentNeedsPairing() {
+        pollingTask?.cancel()
+        fallbackPollingTask?.cancel()
+        configurationTask?.cancel()
+        pollingTask = nil
+        fallbackPollingTask = nil
+        configurationTask = nil
+        lastShellEventAt = nil
+        emitConnection(.needsPairing, detail: Self.needsPairingDetail)
+        if let client {
+            Task { await client.disconnect() }
+        }
     }
 
     private func newestShell(
@@ -4649,6 +5087,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         }
     }
 
+    /// After a request is answered, the detail stream delivers the matching
+    /// `approval.resolved` or `user-input.resolved` event. Re-reading the
+    /// snapshot here would replace `activeRawThread` with the first page and
+    /// drop every "Load earlier" page the user opened. Only fall back to a
+    /// read when the stream is not synchronized for this thread.
+    private func refreshThreadUnlessLive(id: String, client: T3Client) async {
+        if activeThreadID == id, detailWasSynchronized { return }
+        try? await refreshThread(id: id, client: client)
+    }
+
     private func refreshThread(
         id: String, client: T3Client, expectedStreamGeneration: Int? = nil
     ) async throws {
@@ -4795,6 +5243,13 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
         let backgroundLiveness = shellThread.backgroundLiveness
         let backgroundWorkIsActive = backgroundLiveness == .working
+        let capabilities = threadCapabilities(for: environment)
+        detail.thread.supportsSettlement = capabilities?.threadSettlement
+        detail.thread.supportsSnooze = capabilities?.threadSnooze
+        detail.thread.supportsPinning = capabilities?.threadPinning
+        detail.thread.supportsTitleRegeneration = capabilities?.threadTitleRegeneration
+        detail.thread.supportsPullRequestLinking = capabilities?.threadPullRequestLinking
+        detail.thread.supportsMultiplePullRequests = capabilities?.threadPullRequests
         let sessionIsLive = shellThread.session?.status == "starting"
             || shellThread.session?.status == "running"
         detail.thread.state = Self.resolveThreadState(
@@ -5034,17 +5489,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             endpoint: environment.httpBaseURL.absoluteString,
             detail: detail
         )
-        if var snapshot = latestSnapshot {
-            snapshot.connection = connection
-            if let index = snapshot.environments.firstIndex(where: { $0.id == environment.id }) {
-                snapshot.environments[index].connectionState = state
-                snapshot.environments[index].connectionDetail = detail
+        if latestSnapshot != nil {
+            latestSnapshot?.connection = connection
+            if let index = latestSnapshot?.environments.firstIndex(where: { $0.id == environment.id }) {
+                latestSnapshot?.environments[index].connectionState = state
+                latestSnapshot?.environments[index].connectionDetail = detail
             }
-            latestSnapshot = snapshot
-            continuation.yield(.snapshot(snapshot))
-            return
         }
-        continuation.yield(.connection(connection))
+        // A reconnect blip used to republish the whole snapshot twice; the
+        // model patches the connection and environment row from this event.
+        continuation.yield(.connection(connection, environmentID: environment.id))
     }
 
     private func makeSnapshot(
@@ -5085,11 +5539,21 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             var threadCountByProjectID: [String: Int] = [:]
             for thread in live { threadCountByProjectID[thread.projectID, default: 0] += 1 }
             for thread in cached { threadCountByProjectID[thread.projectID, default: 0] += 1 }
-            let serverDefault = serverConfigsByEnvironmentID[environment.id]?.settings?.defaultModelSelection
+            let projectConfig = serverConfigsByEnvironmentID[environment.id]
+            let projectSettings = projectConfig?.settings ?? ServerSettingsSnapshot()
+            let disabledProviderIDs = Set((projectConfig?.providers ?? []).filter { !providerCanRun($0) }.map(\.instanceId))
+            let supportsProjectSettings = projectConfig?.environment?.capabilities.projectSettingsOverrides == true
             let mappedProjects = projection.mapProjects(
                 shellsByEnvironmentID[environment.id]?.projects ?? [],
-                defaultModelSelection: serverDefault
+                settings: projectSettings,
+                disabledProviderIDs: disabledProviderIDs,
+                supportsProjectSettings: supportsProjectSettings
             ) { project in
+                let effective = projectSettings.resolvingProject(
+                    id: project.id, legacyModelSelection: project.defaultModelSelection,
+                    legacyWorkspaceMode: project.defaultThreadEnvMode,
+                    disabledProviderIDs: disabledProviderIDs
+                )
                 let uiID = FeatureScopedID.project(
                     environmentID: environment.id,
                     wireID: project.id
@@ -5101,7 +5565,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     name: project.title,
                     path: project.workspaceRoot,
                     threadCount: 0,
-                    defaultSelection: (project.defaultModelSelection ?? serverDefault).map(mapSelection),
+                    defaultSelection: effective.defaultModelSelection.map(mapSelection),
                     repositoryIdentity: project.repositoryIdentity.map {
                         FeatureRepositoryIdentity(
                             canonicalKey: $0.canonicalKey,
@@ -5114,6 +5578,9 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     updatedAt: project.updatedAt
                 )
                 mapped.projectIcon = project.projectIcon
+                mapped.defaultWorkspaceMode = effective.defaultThreadEnvMode == .worktree ? .worktree : .local
+                mapped.newWorktreesStartFromOrigin = effective.newWorktreesStartFromOrigin
+                mapped.supportsProjectSettingsOverrides = supportsProjectSettings
                 return mapped
             }
             for var project in mappedProjects {
@@ -5226,12 +5693,22 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return mapped
     }
 
+    /// The live server config is the source of truth for capabilities, the
+    /// same way the web sidebar reads them. The pair-time descriptor only
+    /// covers the window before the first config subscription lands, so a
+    /// server upgrade takes effect without re-pairing.
+    private func threadCapabilities(for environment: Environment) -> EnvironmentDescriptor.Capabilities? {
+        serverConfigsByEnvironmentID[environment.id]?.environment?.capabilities
+            ?? environment.descriptor?.capabilities
+    }
+
     private func mapThread(
         _ thread: OrchestrationThreadShell,
         environment: Environment
     ) -> FeatureThread {
         let backgroundLiveness = thread.backgroundLiveness
         let backgroundWorkIsActive = backgroundLiveness == .working
+        let capabilities = threadCapabilities(for: environment)
         return FeatureThread(
             id: FeatureScopedID.thread(environmentID: environment.id, wireID: thread.id),
             wireID: thread.id,
@@ -5245,6 +5722,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            pullRequests: thread.pullRequests,
             branchPullRequest: thread.branchPullRequest,
             createdAt: parseDate(thread.createdAt),
             updatedAt: parseDate(thread.updatedAt),
@@ -5267,7 +5745,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             isArchived: thread.archivedAt != nil,
             isSettled: isSettled(thread.settledOverride, settledAt: thread.settledAt),
             keepsActive: thread.settledOverride == "active",
-            settledAt: thread.settledAt.map(parseDate),
+            settledAt: thread.settledAt.flatMap(parseValidDate),
             unsettledAt: thread.unsettledAt.flatMap(parseValidDate),
             activeOrderKey: thread.activeOrderKey,
             lastActivityAt: lastActivityDate(
@@ -5277,11 +5755,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             snoozedUntil: thread.snoozedUntil.map(parseDate),
             snoozedAt: thread.snoozedAt.map(parseDate),
             pinnedAt: thread.pinnedAt.map(parseDate),
-            supportsSettlement: environment.descriptor?.capabilities.threadSettlement,
-            supportsSnooze: environment.descriptor?.capabilities.threadSnooze,
-            supportsPinning: environment.descriptor?.capabilities.threadPinning,
-            supportsTitleRegeneration: environment.descriptor?.capabilities.threadTitleRegeneration,
-            supportsPullRequestLinking: environment.descriptor?.capabilities.threadPullRequestLinking,
+            pinOrderKey: thread.pinOrderKey,
+            supportsSettlement: capabilities?.threadSettlement,
+            supportsSnooze: capabilities?.threadSnooze,
+            supportsPinning: capabilities?.threadPinning,
+            supportsPinReorder: capabilities?.threadPinReorder,
+            supportsActiveReorder: capabilities?.threadActiveReorder,
+            supportsTitleRegeneration: capabilities?.threadTitleRegeneration,
+            supportsPullRequestLinking: capabilities?.threadPullRequestLinking,
+            supportsMultiplePullRequests: capabilities?.threadPullRequests,
             isRegeneratingTitle: thread.titleRegeneration != nil,
             attentionAt: failureDate(
                 latestTurn: thread.latestTurn,
@@ -5316,6 +5798,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             environmentID: environment.id
         )
         let backgroundWorkIsActive = backgroundLiveness == .working
+        let capabilities = threadCapabilities(for: environment)
         return FeatureThread(
             id: FeatureScopedID.thread(environmentID: environment.id, wireID: thread.id),
             wireID: thread.id,
@@ -5330,6 +5813,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            pullRequests: thread.pullRequests,
             branchPullRequest: thread.branchPullRequest,
             createdAt: parseDate(thread.createdAt),
             updatedAt: parseDate(thread.updatedAt),
@@ -5352,7 +5836,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             isArchived: thread.archivedAt != nil,
             isSettled: isSettled(thread.settledOverride, settledAt: thread.settledAt),
             keepsActive: thread.settledOverride == "active",
-            settledAt: thread.settledAt.map(parseDate),
+            settledAt: thread.settledAt.flatMap(parseValidDate),
             unsettledAt: thread.unsettledAt.flatMap(parseValidDate),
             activeOrderKey: thread.activeOrderKey,
             lastActivityAt: lastActivityDate(
@@ -5362,11 +5846,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             snoozedUntil: thread.snoozedUntil.map(parseDate),
             snoozedAt: thread.snoozedAt.map(parseDate),
             pinnedAt: thread.pinnedAt.map(parseDate),
-            supportsSettlement: environment.descriptor?.capabilities.threadSettlement,
-            supportsSnooze: environment.descriptor?.capabilities.threadSnooze,
-            supportsPinning: environment.descriptor?.capabilities.threadPinning,
-            supportsTitleRegeneration: environment.descriptor?.capabilities.threadTitleRegeneration,
-            supportsPullRequestLinking: environment.descriptor?.capabilities.threadPullRequestLinking,
+            pinOrderKey: thread.pinOrderKey,
+            supportsSettlement: capabilities?.threadSettlement,
+            supportsSnooze: capabilities?.threadSnooze,
+            supportsPinning: capabilities?.threadPinning,
+            supportsPinReorder: capabilities?.threadPinReorder,
+            supportsActiveReorder: capabilities?.threadActiveReorder,
+            supportsTitleRegeneration: capabilities?.threadTitleRegeneration,
+            supportsPullRequestLinking: capabilities?.threadPullRequestLinking,
+            supportsMultiplePullRequests: capabilities?.threadPullRequests,
             isRegeneratingTitle: thread.titleRegeneration != nil,
             attentionAt: failureDate(
                 latestTurn: thread.latestTurn,
@@ -5662,6 +6150,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             branch: loaded.branch,
             worktreePath: loaded.worktreePath,
             linkedPullRequest: loaded.linkedPullRequest,
+            pullRequests: loaded.pullRequests,
             branchPullRequest: loaded.branchPullRequest,
             latestTurn: loaded.latestTurn,
             createdAt: loaded.createdAt,
@@ -5674,6 +6163,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
             snoozedUntil: loaded.snoozedUntil,
             snoozedAt: loaded.snoozedAt,
             pinnedAt: loaded.pinnedAt,
+            pinOrderKey: loaded.pinOrderKey,
             titleRegeneration: loaded.titleRegeneration,
             deletedAt: loaded.deletedAt,
             messages: prependByID(older.messages, loaded.messages),
@@ -5915,10 +6405,12 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     name: $0.name,
                     mimeType: $0.mimeType,
                     sizeBytes: $0.sizeBytes,
-                    url: cachedAttachmentURL(for: $0.id, environmentID: environmentID)
+                    url: cachedAttachmentURL(for: $0.id, environmentID: environmentID),
+                    source: $0.source.flatMap { try? $0.decode(PastedTextAttachmentSource.self) }
                 )
             },
-            updatedAt: parseDate(message.updatedAt)
+            updatedAt: parseDate(message.updatedAt),
+            context: message.context
         )
     }
 
@@ -6075,11 +6567,15 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         hasUserInput: Bool,
         backgroundLiveness: OrchestrationBackgroundLiveness?
     ) -> FeatureThreadState {
+        // Same rules as the web sidebar (resolveSidebarThreadStatus): the
+        // session owns working and failed. `latestTurn.state` is not consulted
+        // because a session that died mid-turn leaves the turn "running"
+        // forever, and a recovered session leaves an old turn "error".
         if hasApprovals { return .waitingForApproval }
         if hasUserInput { return .waitingForInput }
         if session?.status == "starting" { return .queued }
-        if session?.status == "running" || latestTurn?.state == "running" { return .working }
-        if session?.status == "error" || latestTurn?.state == "error" { return .failed }
+        if session?.status == "running" { return .working }
+        if session?.status == "error" { return .failed }
         if backgroundLiveness == .working { return .working }
         if backgroundLiveness == .monitoring { return .monitoring }
         if latestTurn?.state == "completed" { return .completed }
@@ -6140,7 +6636,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         thread.settledAt = shell.settledAt.flatMap(parseValidDate)
         thread.unsettledAt = shell.unsettledAt.flatMap(parseValidDate)
         thread.activeOrderKey = shell.activeOrderKey
+        thread.pinnedAt = shell.pinnedAt.flatMap(parseValidDate)
+        thread.pinOrderKey = shell.pinOrderKey
         thread.linkedPullRequest = shell.linkedPullRequest
+        thread.pullRequests = shell.pullRequests
         thread.branchPullRequest = shell.branchPullRequest
         thread.settlementFacts = settlementFacts(
             override: shell.settledOverride,
@@ -6185,6 +6684,10 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     /// Single write path for server configs so the provider catalog cache can
     /// never go stale against the config that feeds it.
     private func setServerConfig(_ config: ServerConfigSnapshot, environmentID: String) {
+        if serverConfigsByEnvironmentID[environmentID]?.environment?.capabilities
+            != config.environment?.capabilities {
+            shellProjectionCache[environmentID] = nil
+        }
         if serverConfigsByEnvironmentID[environmentID]?.providers != config.providers {
             providerCatalogCache[environmentID] = nil
         }
@@ -6341,13 +6844,16 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         if let selection {
             return coreModelSelection(selection)
         }
-        if let projectDefault = shell?.projects
-            .first(where: { $0.id == projectID })?
-            .defaultModelSelection {
+        let project = shell?.projects.first(where: { $0.id == projectID })
+        let config = serverConfigsByEnvironmentID[environmentID]
+        let settings = config?.settings ?? ServerSettingsSnapshot()
+        let effective = settings.resolvingProject(
+            id: projectID, legacyModelSelection: project?.defaultModelSelection,
+            legacyWorkspaceMode: project?.defaultThreadEnvMode,
+            disabledProviderIDs: Set((config?.providers ?? []).filter { !providerCanRun($0) }.map(\.instanceId))
+        )
+        if let projectDefault = effective.defaultModelSelection {
             return projectDefault
-        }
-        if let serverDefault = serverConfigsByEnvironmentID[environmentID]?.settings?.defaultModelSelection {
-            return serverDefault
         }
         return fallbackModelSelection(
             environmentID: environmentID,
@@ -6595,6 +7101,25 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return resolved.url
     }
 
+    func contextAttachmentAssetURL(
+        environmentID: String, attachment: ComposerContextRecord.Attachment
+    ) async throws -> URL {
+        try Task.checkCancellation()
+        guard try await runtime.environments().contains(where: { $0.id == environmentID && $0.isEnabled }) else {
+            throw ComposerContextClipboardError.sourceUnavailable
+        }
+        let client = try await projectCreationClient(environmentID: environmentID)
+        let generation = environmentGeneration
+        let resolved = try await client.resolvedAsset(resource: .attachment(
+            id: attachment.attachmentId, fileName: attachment.name, mimeType: attachment.mimeType
+        ))
+        try Task.checkCancellation()
+        guard isKnownClient(client, environmentID: environmentID, generation: generation) else {
+            throw CancellationError()
+        }
+        return resolved.url
+    }
+
     private func lastActivityDate(
         latestUserMessageAt: String?,
         latestTurn: OrchestrationLatestTurn?
@@ -6634,7 +7159,6 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
     ) -> Date? {
         let directSessionIsLive = session?.status == "starting"
             || session?.status == "running"
-            || latestTurn?.state == "running"
         guard directSessionIsLive || backgroundWorkIsActive else {
             return nil
         }
@@ -6660,35 +7184,47 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
 
     private func makeUploadAttachments(
         _ attachments: [FeatureUploadAttachment]
-    ) throws -> [UploadChatAttachment] {
+    ) async throws -> [UploadChatAttachment] {
         guard attachments.count <= 8 else {
             throw NativeFeatureClientError.tooManyAttachments
         }
-        return try attachments.map {
-            let reference = $0.uploadedReference.map {
-                UploadedAttachmentReference(
-                    environmentID: $0.environmentID,
-                    attachmentID: $0.attachmentID
-                )
-            }
-            if let ownedFile = $0.ownedFile {
+        let uploads = try await Task.detached(priority: .userInitiated) {
+            try attachments.map {
+                let reference = $0.uploadedReference.map {
+                    UploadedAttachmentReference(
+                        environmentID: $0.environmentID,
+                        attachmentID: $0.attachmentID
+                    )
+                }
+                if let ownedFile = $0.ownedFile {
+                    if $0.mimeType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().hasPrefix("image/") {
+                        return try UploadChatAttachment(
+                            id: $0.id, data: Data(contentsOf: ownedFile.url),
+                            name: $0.name, mimeType: $0.mimeType, uploadedReference: reference
+                        )
+                    }
+                    return try UploadChatAttachment(
+                        id: $0.id,
+                        fileURL: ownedFile.url,
+                        name: $0.name,
+                        mimeType: $0.mimeType,
+                        sizeBytes: ownedFile.byteCount,
+                        uploadedReference: reference,
+                        contextSource: $0.source
+                    )
+                }
                 return try UploadChatAttachment(
                     id: $0.id,
-                    fileURL: ownedFile.url,
+                    data: $0.data,
                     name: $0.name,
                     mimeType: $0.mimeType,
-                    sizeBytes: ownedFile.byteCount,
-                    uploadedReference: reference
+                    uploadedReference: reference,
+                    contextSource: $0.source
                 )
             }
-            return try UploadChatAttachment(
-                id: $0.id,
-                data: $0.data,
-                name: $0.name,
-                mimeType: $0.mimeType,
-                uploadedReference: reference
-            )
-        }
+        }.value
+        try Task.checkCancellation()
+        return uploads
     }
 
     private func requireScope(_ scope: String, client: T3Client) async throws {
@@ -6731,11 +7267,18 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
         return compact.count > 160 ? "\(compact.prefix(157))..." : compact
     }
 
+    /// Decoded once per process and on every `saveSettings`. `makeSnapshot`
+    /// runs on every publish, so it must not hit UserDefaults and JSONDecoder.
     private func loadSettings() -> FeatureSettings {
-        guard let data = settingsStore.data(forKey: Self.settingsKey),
-              let settings = try? JSONDecoder().decode(FeatureSettings.self, from: data) else {
-            return FeatureSettings()
+        if let cachedSettings { return cachedSettings }
+        let settings: FeatureSettings
+        if let data = settingsStore.data(forKey: Self.settingsKey),
+           let decoded = try? JSONDecoder().decode(FeatureSettings.self, from: data) {
+            settings = decoded
+        } else {
+            settings = FeatureSettings()
         }
+        cachedSettings = settings
         return settings
     }
 
@@ -6874,8 +7417,11 @@ enum NativeQuestionAnswerHistory {
 
 enum NativeActivityNotice {
     static func accepts(_ activity: OrchestrationActivity) -> Bool {
-        activity.tone == "error" || activity.kind == "runtime.warning"
-            || activity.kind == "context-compaction"
+        guard activity.tone == "error" || activity.kind == "runtime.warning"
+            || activity.kind == "context-compaction" else { return false }
+        if NativeActivityFilters.isNoContentRuntimeWarning(activity) { return false }
+        if NativeActivityFilters.isAgentInternal(activity) { return false }
+        return true
     }
 
     static func message(_ activity: OrchestrationActivity, createdAt: Date) -> FeatureMessage? {
@@ -6900,6 +7446,40 @@ enum NativeActivityNotice {
             state: .complete,
             toolName: activity.kind
         )
+    }
+}
+
+/// Row filters shared with the web transcript (apps/web/src/session-logic.ts).
+/// Rows owned by a subagent, bypassed lifecycle rows, and adapter warnings with
+/// no displayable text belong to the fleet view, not the parent timeline.
+enum NativeActivityFilters {
+    static func isNoContentRuntimeWarning(_ activity: OrchestrationActivity) -> Bool {
+        activity.kind == "runtime.warning"
+            && activity.summary.hasSuffix("(no displayable text content)")
+    }
+
+    static func isPlanBoundaryTool(_ activity: OrchestrationActivity) -> Bool {
+        guard activity.kind == "tool.updated" || activity.kind == "tool.completed" else {
+            return false
+        }
+        return activity.payload["detail"]?.stringValue?.hasPrefix("ExitPlanMode:") == true
+    }
+
+    static func isAgentInternal(_ activity: OrchestrationActivity) -> Bool {
+        let ownedByAgent = activity.payload["agentId"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let bypassed = activity.payload["timelineBypass"]?.boolValue == true
+        let isTaskRow = activity.kind.hasPrefix("task.")
+        if isTaskRow {
+            guard ownedByAgent || bypassed else { return false }
+            // A nested agent's own task row stays visible as a spawn anchor;
+            // its background shell rows and updates do not.
+            let isAgentTaskRow = activity.kind != "task.updated"
+                && activity.payload["taskId"]?.stringValue != nil
+                && activity.payload["agentKind"]?.stringValue == "agent"
+            return !isAgentTaskRow
+        }
+        return bypassed || ownedByAgent
     }
 }
 
@@ -6963,7 +7543,7 @@ enum NativeSharedPreferenceChange {
 
 struct NativeWorkLogAccumulator {
     private static let terminalKinds = Set([
-        "tool.completed", "task.completed", "turn.plan.updated",
+        "tool.completed", "task.completed",
     ])
     private static let activeKinds = Set(["tool.started", "tool.updated"])
     private static let imageExtensions = Set([
@@ -6983,8 +7563,13 @@ struct NativeWorkLogAccumulator {
     var hasContent: Bool { count > 0 || hasActiveWork || !imagePaths.isEmpty }
 
     static func accepts(_ activity: OrchestrationActivity) -> Bool {
-        activeKinds.contains(activity.kind)
-            || (activity.tone != "error" && terminalKinds.contains(activity.kind))
+        guard activeKinds.contains(activity.kind)
+            || (activity.tone != "error" && terminalKinds.contains(activity.kind)) else {
+            return false
+        }
+        if NativeActivityFilters.isPlanBoundaryTool(activity) { return false }
+        if NativeActivityFilters.isAgentInternal(activity) { return false }
+        return true
     }
 
     mutating func append(
@@ -7139,6 +7724,14 @@ enum NativeThreadDetailReducer {
             result = reduceUnsettled(payload: payload, thread: thread)
         case "thread.meta-updated":
             result = reduceMetadata(payload: payload, occurredAt: occurredAt, thread: thread)
+        case "thread.pin-reordered":
+            result = reducePinReordered(
+                payload: payload,
+                occurredAt: occurredAt,
+                thread: thread
+            )
+        case "thread.pull-request-linked", "thread.pull-request-unlinked", "thread.pull-request-synced":
+            result = reducePullRequest(type: type, payload: payload, thread: thread)
         case "thread.message-sent":
             result = reduceMessage(
                 payload: payload,
@@ -7219,6 +7812,45 @@ enum NativeThreadDetailReducer {
         )
     }
 
+    private static func reducePullRequest(
+        type: String, payload: JSONValue, thread: OrchestrationThread
+    ) -> NativeThreadDetailReductionResult {
+        guard let updatedAt = payload["updatedAt"]?.stringValue else { return .refresh }
+        var updated = replacing(thread, updatedAt: updatedAt)
+        var links = thread.pullRequests ?? []
+        if type == "thread.pull-request-linked" {
+            guard let link = try? payload["link"]?.decode(ThreadPullRequestLink.self) else { return .refresh }
+            if let index = links.firstIndex(where: { $0.id == link.id }) { links[index] = link }
+            else { links.append(link) }
+        } else {
+            guard let host = payload["host"]?.stringValue,
+                  let repository = payload["repository"]?.stringValue,
+                  let number = intValue(payload["number"]) else { return .refresh }
+            let key = ThreadPullRequestKey(host: host, repository: repository, number: number)
+            guard let index = links.firstIndex(where: { $0.id == key }) else { return .unchanged }
+            if type == "thread.pull-request-unlinked" {
+                links.remove(at: index)
+            } else {
+                guard let snapshot = try? payload["snapshot"]?.decode(ThreadPullRequestSnapshot.self),
+                      let stackValue = payload["stack"] else { return .refresh }
+                let stack: ThreadPullRequestStack?
+                if stackValue == .null { stack = nil }
+                else {
+                    guard let decoded = try? stackValue.decode(ThreadPullRequestStack.self) else { return .refresh }
+                    stack = decoded
+                }
+                links[index].snapshot = snapshot
+                links[index].stack = stack
+            }
+        }
+        updated.pullRequests = links
+        if let legacy = updated.linkedPullRequest,
+           !links.contains(where: { $0.isVisible && $0.number == legacy.number && $0.url == legacy.url }) {
+            updated.linkedPullRequest = nil
+        }
+        return .updated(updated)
+    }
+
     private static func reduceMetadata(
         payload: JSONValue,
         occurredAt: String,
@@ -7273,6 +7905,23 @@ enum NativeThreadDetailReducer {
         return .updated(updated)
     }
 
+    private static func reducePinReordered(
+        payload: JSONValue,
+        occurredAt: String,
+        thread: OrchestrationThread
+    ) -> NativeThreadDetailReductionResult {
+        guard let orderKey = payload["orderKey"]?.stringValue,
+              !orderKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .refresh
+        }
+        var updated = replacing(
+            thread,
+            updatedAt: payload["updatedAt"]?.stringValue ?? occurredAt
+        )
+        updated.pinOrderKey = orderKey
+        return .updated(updated)
+    }
+
     private static func reduceMessage(
         payload: JSONValue,
         occurredAt: String,
@@ -7288,6 +7937,13 @@ enum NativeThreadDetailReducer {
             return .refresh
         }
         let turnID = payload["turnId"]?.stringValue
+        let context: OrchestrationMessageContext?
+        if let rawContext = payload["context"], rawContext != .null {
+            guard let decoded = try? rawContext.decode(OrchestrationMessageContext.self) else { return .refresh }
+            context = decoded
+        } else {
+            context = nil
+        }
         let attachments: [ChatAttachment]?
         if let rawAttachments = payload["attachments"], rawAttachments != .null {
             guard let decoded = try? rawAttachments.decode([ChatAttachment].self) else {
@@ -7312,7 +7968,8 @@ enum NativeThreadDetailReducer {
                 turnId: turnID,
                 streaming: streaming,
                 createdAt: existing.createdAt,
-                updatedAt: streaming ? existing.updatedAt : updatedAt
+                updatedAt: streaming ? existing.updatedAt : updatedAt,
+                context: context ?? existing.context
             )
             renderMutation = .message(messages[index])
         } else {
@@ -7324,7 +7981,8 @@ enum NativeThreadDetailReducer {
                 turnId: turnID,
                 streaming: streaming,
                 createdAt: createdAt,
-                updatedAt: updatedAt
+                updatedAt: updatedAt,
+                context: context
             )
             messages.append(message)
             renderMutation = .message(message)
@@ -7518,6 +8176,7 @@ enum NativeThreadDetailReducer {
             branch: thread.branch,
             worktreePath: thread.worktreePath,
             linkedPullRequest: thread.linkedPullRequest,
+            pullRequests: thread.pullRequests,
             branchPullRequest: thread.branchPullRequest,
             latestTurn: latestTurn ?? thread.latestTurn,
             createdAt: thread.createdAt,
@@ -7530,6 +8189,7 @@ enum NativeThreadDetailReducer {
             snoozedUntil: thread.snoozedUntil,
             snoozedAt: thread.snoozedAt,
             pinnedAt: thread.pinnedAt,
+            pinOrderKey: thread.pinOrderKey,
             titleRegeneration: thread.titleRegeneration,
             deletedAt: thread.deletedAt,
             messages: messages ?? thread.messages,
@@ -7598,17 +8258,24 @@ struct NativeShellProjection {
 
     private var threadContext: ThreadContext?
     private var threads = NativeShellRowProjection<OrchestrationThreadShell, FeatureThread>()
-    private var projectDefaultModelSelection: ModelSelection?
+    private var projectSettings: ServerSettingsSnapshot?
+    private var disabledProjectProviderIDs: Set<String> = []
+    private var supportsProjectSettings = false
     private var projects = NativeShellRowProjection<OrchestrationProject, FeatureProject>()
 
     mutating func mapProjects(
         _ source: [OrchestrationProject],
-        defaultModelSelection: ModelSelection?,
+        settings: ServerSettingsSnapshot,
+        disabledProviderIDs: Set<String> = [],
+        supportsProjectSettings: Bool = false,
         transform: (OrchestrationProject) -> FeatureProject
     ) -> [FeatureProject] {
-        if projectDefaultModelSelection != defaultModelSelection {
+        if projectSettings != settings
+            || disabledProjectProviderIDs != disabledProviderIDs || self.supportsProjectSettings != supportsProjectSettings {
             projects = NativeShellRowProjection()
-            projectDefaultModelSelection = defaultModelSelection
+            projectSettings = settings
+            disabledProjectProviderIDs = disabledProviderIDs
+            self.supportsProjectSettings = supportsProjectSettings
         }
         return projects.map(source, transform: transform)
     }
@@ -7650,6 +8317,8 @@ private struct EnvironmentShellLoad: Sendable {
     let client: T3Client
     let shell: OrchestrationShellSnapshot?
     let config: ServerConfigSnapshot?
+    /// The server answered and refused the saved credential.
+    var credentialRejected = false
 }
 
 private struct EntityWireOwner: Hashable {
@@ -7737,6 +8406,7 @@ private struct BootstrapSubmissionSignature: Equatable {
     let worktreePath: String?
     let startFromOrigin: Bool
     let attachments: [FeatureUploadAttachment]
+    var context: OrchestrationMessageContext? = nil
 }
 
 private struct PendingBootstrapSubmission {
@@ -7763,6 +8433,7 @@ private struct TurnSubmissionSignature: Equatable {
     let runtimeMode: RuntimeMode
     let interactionMode: InteractionMode
     let attachments: [FeatureUploadAttachment]
+    var context: OrchestrationMessageContext? = nil
 }
 
 private struct PendingTurnSubmission {
@@ -7787,9 +8458,12 @@ private enum NativeFeatureClientError: LocalizedError {
     case tooManyAttachments
     case invalidAutomaticSettlementDays
     case remoteStatusUnavailable
+    case invalidPullRequestLink
 
     var errorDescription: String? {
         switch self {
+        case .invalidPullRequestLink:
+            "Use a supported pull request URL. Older servers need a project for its repository."
         case .notConnected: "Connect to a T3 environment first."
         case .environmentNotFound: "That T3 environment is no longer available."
         case .projectNotFound: "The selected project is no longer available."

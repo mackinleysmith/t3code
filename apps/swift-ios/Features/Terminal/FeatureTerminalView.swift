@@ -153,6 +153,7 @@ final class TerminalInputSession {
 public struct FeatureTerminalView: View {
     let client: any FeatureClient
     let threadID: String
+    let onAttachContext: ((ComposerContextRecord) throws -> Void)?
 
     @SwiftUI.Environment(\.dismiss) private var dismiss
     @AppStorage("terminalFontSize") private var storedFontSize = TerminalFontSize.defaultValue
@@ -163,15 +164,15 @@ public struct FeatureTerminalView: View {
     @State private var columns = 80
     @State private var rows = 24
     @State private var focusRequest = 0
-    @State private var surfaceGeneration = 0
     @State private var isLoading = true
     @State private var isOpening = false
     @State private var errorMessage: String?
     @State private var inputSession = TerminalInputSession()
 
-    public init(client: any FeatureClient, threadID: String) {
+    public init(client: any FeatureClient, threadID: String, onAttachContext: ((ComposerContextRecord) throws -> Void)? = nil) {
         self.client = client
         self.threadID = threadID
+        self.onAttachContext = onAttachContext
     }
 
     public var body: some View {
@@ -202,9 +203,23 @@ public struct FeatureTerminalView: View {
                 },
                 onFontSizeStep: { direction in
                     stepFontSize(direction)
+                },
+                onAttachOutput: onAttachContext.map { attach in
+                    { output in
+                        guard !output.isEmpty else { return }
+                        do {
+                            try attach(FeatureComposerContext.terminalRecord(
+                                text: output, terminalID: activeTerminalID,
+                                label: terminal.map(TerminalSessionList.displayTitle) ?? "Terminal"
+                            ))
+                            dismiss()
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
+                    }
                 }
             )
-            .id("\(terminalTaskID):\(fontSize):\(surfaceGeneration)")
+            .id(terminalTaskID)
             .padding(.top, 48)
 
             if isLoading, terminal == nil {
@@ -274,11 +289,7 @@ public struct FeatureTerminalView: View {
                 guard !Task.isCancelled, terminalID == activeTerminalID else { break }
                 let shouldSyncGrid = !isRunning
                     && (update.state == .running || update.state == .starting)
-                let currentBuffer = terminal?.buffer
                 guard updateTerminal(update) else { continue }
-                if let currentBuffer, !update.buffer.hasPrefix(currentBuffer) {
-                    surfaceGeneration += 1
-                }
                 if shouldSyncGrid {
                     try? await client.resizeTerminal(
                         threadID: threadID,
@@ -622,7 +633,6 @@ public struct FeatureTerminalView: View {
         do {
             if terminalID == activeTerminalID {
                 terminal?.buffer = ""
-                surfaceGeneration += 1
             }
             try await client.clearTerminal(
                 threadID: threadID,

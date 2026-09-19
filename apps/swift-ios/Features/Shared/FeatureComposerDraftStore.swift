@@ -1,6 +1,7 @@
 import Foundation
 
 public struct FeatureComposerDraft: Sendable, Equatable {
+    public var context: OrchestrationMessageContext?
     public var text: String
     public var attachments: [FeatureDraftAttachment]
     public var selection: FeatureSelection?
@@ -10,12 +11,14 @@ public struct FeatureComposerDraft: Sendable, Equatable {
         text: String = "",
         attachments: [FeatureDraftAttachment] = [],
         selection: FeatureSelection? = nil,
-        workspace: FeatureComposerWorkspaceDraft? = nil
+        workspace: FeatureComposerWorkspaceDraft? = nil,
+        context: OrchestrationMessageContext? = nil
     ) {
         self.text = text
         self.attachments = attachments
         self.selection = selection
         self.workspace = workspace
+        self.context = context
     }
 
     public var isEmpty: Bool {
@@ -89,6 +92,7 @@ public actor FeatureComposerDraftStore {
     }
 
     private struct PersistedDraft: Codable {
+        var context: OrchestrationMessageContext?
         var text: String
         var attachments: [PersistedAttachment]
         var selection: FeatureSelection?
@@ -97,6 +101,7 @@ public actor FeatureComposerDraftStore {
 
         init(_ draft: FeatureComposerDraft) {
             text = draft.text
+            context = draft.context
             attachments = draft.attachments.map(PersistedAttachment.init)
             selection = draft.selection
             workspace = draft.workspace.map(PersistedWorkspace.init)
@@ -108,7 +113,8 @@ public actor FeatureComposerDraftStore {
                 text: text,
                 attachments: attachments.compactMap { $0.featureValue(fileStore: fileStore) },
                 selection: selection,
-                workspace: workspace?.featureValue
+                workspace: workspace?.featureValue,
+                context: context
             )
         }
     }
@@ -137,6 +143,7 @@ public actor FeatureComposerDraftStore {
     }
 
     private struct PersistedAttachment: Codable {
+        var source: PastedTextAttachmentSource?
         var id: UUID
         var data: Data?
         var ownedFileName: String?
@@ -148,6 +155,7 @@ public actor FeatureComposerDraftStore {
 
         init(_ attachment: FeatureDraftAttachment) {
             id = attachment.id
+            source = attachment.source
             data = attachment.ownedFile == nil ? attachment.data : nil
             ownedFileName = attachment.ownedFile?.fileName
             byteCount = attachment.byteCount
@@ -169,7 +177,8 @@ public actor FeatureComposerDraftStore {
                     thumbnailData: thumbnailData,
                     filename: filename,
                     mimeType: mimeType,
-                    uploadedReference: uploadedReference
+                    uploadedReference: uploadedReference,
+                    source: source
                 )
             }
             guard let data else { return nil }
@@ -179,7 +188,8 @@ public actor FeatureComposerDraftStore {
                 thumbnailData: thumbnailData,
                 filename: filename,
                 mimeType: mimeType,
-                uploadedReference: uploadedReference
+                uploadedReference: uploadedReference,
+                source: source
             )
         }
 
@@ -187,6 +197,7 @@ public actor FeatureComposerDraftStore {
             guard id == attachment.id,
                   filename == attachment.filename,
                   mimeType == attachment.mimeType,
+                  source == attachment.source,
                   (byteCount ?? data?.count ?? 0) == attachment.byteCount else { return false }
             if let ownedFileName {
                 return ownedFileName == attachment.ownedFile?.fileName
@@ -218,6 +229,23 @@ public actor FeatureComposerDraftStore {
         guard let draft = try loadIfNeeded()[key]?.featureValue(fileStore: attachmentFileStore),
               !draft.isEmpty else { return nil }
         return draft
+    }
+
+    public func clipboardAttachment(environmentID: String, attachmentID: String) throws -> FeatureDraftAttachment? {
+        for (key, draft) in try loadIfNeeded() {
+            for attachment in draft.attachments {
+                // Logical-project drafts move between environments. Their local UUID identifies
+                // the bytes. Server attachment IDs still require the matching upload environment.
+                let localMatch = (key.hasPrefix("environment:\(environmentID):")
+                    || key.hasPrefix(Self.rewindRecoveryKey(for: "environment:\(environmentID):"))
+                    || key.hasPrefix("logical-project:"))
+                    && attachment.id.uuidString.caseInsensitiveCompare(attachmentID) == .orderedSame
+                let uploadedMatch = attachment.uploadedReference?.environmentID == environmentID
+                    && attachment.uploadedReference?.attachmentID == attachmentID
+                if localMatch || uploadedMatch { return attachment.featureValue(fileStore: attachmentFileStore) }
+            }
+        }
+        return nil
     }
 
     public func setDraft(_ draft: FeatureComposerDraft, for key: String) throws {
@@ -326,18 +354,75 @@ public actor FeatureComposerDraftStore {
         loadedDrafts = drafts
     }
 
+    public static func rewindRecoveryKey(for threadKey: String) -> String {
+        "rewind-recovery:" + threadKey
+    }
+
+    public func hasRewindRecovery(for threadKey: String) throws -> Bool {
+        try loadIfNeeded()[Self.rewindRecoveryKey(for: threadKey)] != nil
+    }
+
+    /// Moving recovery into the composer is one disk write. A crash cannot
+    /// leave the same recovered message available to append a second time.
+    public func consumeRewindRecovery(for threadKey: String) throws -> FeatureComposerDraft? {
+        var drafts = try loadIfNeeded()
+        let recoveryKey = Self.rewindRecoveryKey(for: threadKey)
+        guard let savedRecovery = drafts[recoveryKey] else { return nil }
+        let recovery = savedRecovery.featureValue(fileStore: attachmentFileStore)
+        let current = drafts[threadKey]?.featureValue(fileStore: attachmentFileStore) ?? FeatureComposerDraft()
+        let files = (recovery.attachments + current.attachments).compactMap(\.ownedFile)
+        let filesAreReadable = files.allSatisfy { file in
+            guard FileManager.default.isReadableFile(atPath: file.url.path),
+                  let attributes = try? file.url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]) else {
+                return false
+            }
+            return attributes.isRegularFile == true && attributes.fileSize == file.byteCount
+        }
+        guard recovery.attachments.count == savedRecovery.attachments.count,
+              current.attachments.count == (drafts[threadKey]?.attachments.count ?? 0),
+              filesAreReadable else {
+            throw FeatureConversationRewindError(message: "Some saved attachments could not be read. The recovery copy is kept.")
+        }
+        guard current.attachments.count + recovery.attachments.count <= 8 else {
+            throw FeatureConversationRewindError(message: "Make room for the saved prompt's attachments before recovering it.")
+        }
+        let recovered = try FeatureConversationRewind.merge(recovery: recovery, into: current)
+        var persisted = PersistedDraft(recovered)
+        persisted.importedShareIDs = drafts[threadKey]?.importedShareIDs
+        drafts[threadKey] = persisted
+        drafts.removeValue(forKey: recoveryKey)
+        try persist(drafts)
+        loadedDrafts = drafts
+        return recovered
+    }
+
+    /// Call only when the command was rejected or never sent. Recovery copies
+    /// have fresh IDs and are not shared with the outbox or existing drafts.
+    public func discardRewindRecovery(for threadKey: String) throws {
+        let recoveryKey = Self.rewindRecoveryKey(for: threadKey)
+        let attachments = try loadIfNeeded()[recoveryKey]?.attachments ?? []
+        try removeDraft(for: recoveryKey)
+        for attachment in attachments {
+            if let fileName = attachment.ownedFileName {
+                try? attachmentFileStore.removeOwnedFile(fileName: fileName)
+            }
+        }
+    }
+
     public func removeDrafts(
         environmentID: String,
         logicalProjectIDs: Set<String> = []
     ) throws {
         var drafts = try loadIfNeeded()
         let environmentPrefix = "environment:\(environmentID):"
+        let rewindPrefix = Self.rewindRecoveryKey(for: environmentPrefix)
         let questionPrefix = FeatureQuestionAttachmentDraft.key(
             inputID: FeatureScopedID.input(environmentID: environmentID, wireID: "")
         )
         let logicalKeys = Set(logicalProjectIDs.map(Self.newTaskKey(logicalProjectID:)))
         drafts = drafts.filter {
-            !$0.key.hasPrefix(environmentPrefix) && !$0.key.hasPrefix(questionPrefix)
+            !$0.key.hasPrefix(environmentPrefix) && !$0.key.hasPrefix(rewindPrefix)
+                && !$0.key.hasPrefix(questionPrefix)
                 && !logicalKeys.contains($0.key)
         }
         try persist(drafts)

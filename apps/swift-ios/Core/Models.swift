@@ -112,13 +112,19 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
         public var threadRestartContinuation: Bool? = nil
         public let threadSnooze: Bool?
         public let threadPinning: Bool?
+        public let threadPinReorder: Bool?
+        public let threadActiveReorder: Bool?
         public let threadTitleRegeneration: Bool?
         public let threadPullRequestLinking: Bool?
+        public var threadPullRequests: Bool? = nil
+        public var pullRequestStackActions: Bool? = nil
         public let serverSelfUpdate: String?
         public let serverSelfUpdateProgress: Bool?
         public var environmentIcon: Bool? = nil
         public var usageLimitSources: Bool? = nil
         public var questionAttachments: Bool? = nil
+        public var projectSettingsOverrides: Bool? = nil
+        public var inlineMessageContext: Bool? = nil
 
         private enum CodingKeys: String, CodingKey {
             case repositoryIdentity
@@ -131,13 +137,19 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             case threadRestartContinuation
             case threadSnooze
             case threadPinning
+            case threadPinReorder
+            case threadActiveReorder
             case threadTitleRegeneration
             case threadPullRequestLinking
+            case threadPullRequests
+            case pullRequestStackActions
             case serverSelfUpdate
             case serverSelfUpdateProgress
             case environmentIcon
             case usageLimitSources
             case questionAttachments
+            case projectSettingsOverrides
+            case inlineMessageContext
         }
 
         public init(from decoder: any Decoder) throws {
@@ -145,6 +157,8 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             environmentIcon = try container.decodeIfPresent(Bool.self, forKey: .environmentIcon)
             usageLimitSources = try container.decodeIfPresent(Bool.self, forKey: .usageLimitSources)
             questionAttachments = try container.decodeIfPresent(Bool.self, forKey: .questionAttachments)
+            projectSettingsOverrides = try container.decodeIfPresent(Bool.self, forKey: .projectSettingsOverrides)
+            inlineMessageContext = try container.decodeIfPresent(Bool.self, forKey: .inlineMessageContext)
             repositoryIdentity =
                 try container.decodeIfPresent(Bool.self, forKey: .repositoryIdentity) ?? false
             connectionProbe = try container.decodeIfPresent(Bool.self, forKey: .connectionProbe)
@@ -165,6 +179,11 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
             )
             threadSnooze = try container.decodeIfPresent(Bool.self, forKey: .threadSnooze)
             threadPinning = try container.decodeIfPresent(Bool.self, forKey: .threadPinning)
+            threadPinReorder = try container.decodeIfPresent(Bool.self, forKey: .threadPinReorder)
+            threadActiveReorder = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .threadActiveReorder
+            )
             threadTitleRegeneration = try container.decodeIfPresent(
                 Bool.self,
                 forKey: .threadTitleRegeneration
@@ -173,6 +192,8 @@ public struct EnvironmentDescriptor: Codable, Equatable, Sendable {
                 Bool.self,
                 forKey: .threadPullRequestLinking
             )
+            threadPullRequests = try container.decodeIfPresent(Bool.self, forKey: .threadPullRequests)
+            pullRequestStackActions = try container.decodeIfPresent(Bool.self, forKey: .pullRequestStackActions)
             serverSelfUpdate = try container.decodeIfPresent(String.self, forKey: .serverSelfUpdate)
             serverSelfUpdateProgress = try container.decodeIfPresent(
                 Bool.self,
@@ -393,6 +414,7 @@ public struct OrchestrationProject: Codable, Identifiable, Equatable, Sendable {
     public let updatedAt: String
     public let deletedAt: String?
     public var projectIcon: ProjectIconOverride? = nil
+    public var defaultThreadEnvMode: ServerThreadEnvironmentMode? = nil
 }
 
 public struct ProjectIconOverride: Codable, Equatable, Hashable, Sendable {
@@ -470,6 +492,7 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let branch: String?
     public let worktreePath: String?
     public var linkedPullRequest: ThreadLinkedPullRequest? = nil
+    public var pullRequests: [ThreadPullRequestLink]? = nil
     public var branchPullRequest: ThreadLinkedPullRequest? = nil
     public let latestTurn: OrchestrationLatestTurn?
     public let createdAt: String
@@ -482,6 +505,7 @@ public struct OrchestrationThreadShell: Codable, Identifiable, Equatable, Sendab
     public let snoozedUntil: String?
     public let snoozedAt: String?
     public let pinnedAt: String?
+    public var pinOrderKey: String? = nil
     public var titleRegeneration: ThreadTitleRegeneration? = nil
     public let session: OrchestrationSession?
     public let latestUserMessageAt: String?
@@ -500,6 +524,7 @@ public struct OrchestrationMessage: Codable, Identifiable, Equatable, Sendable {
     public let streaming: Bool
     public let createdAt: String
     public let updatedAt: String
+    public var context: OrchestrationMessageContext? = nil
 }
 
 public struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
@@ -508,6 +533,7 @@ public struct ChatAttachment: Codable, Identifiable, Equatable, Sendable {
     public let name: String
     public let mimeType: String
     public let sizeBytes: Int
+    public var source: JSONValue? = nil
 }
 
 public struct OrchestrationActivity: Codable, Identifiable, Equatable, Sendable {
@@ -548,6 +574,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     public let branch: String?
     public let worktreePath: String?
     public var linkedPullRequest: ThreadLinkedPullRequest? = nil
+    public var pullRequests: [ThreadPullRequestLink]? = nil
     public var branchPullRequest: ThreadLinkedPullRequest? = nil
     public let latestTurn: OrchestrationLatestTurn?
     public let createdAt: String
@@ -560,6 +587,7 @@ public struct OrchestrationThread: Codable, Identifiable, Equatable, Sendable {
     public let snoozedUntil: String?
     public let snoozedAt: String?
     public let pinnedAt: String?
+    public var pinOrderKey: String? = nil
     public var titleRegeneration: ThreadTitleRegeneration? = nil
     public let deletedAt: String?
     @ForwardCompatibleArray public var messages: [OrchestrationMessage]

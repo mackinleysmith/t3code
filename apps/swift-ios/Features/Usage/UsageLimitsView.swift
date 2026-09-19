@@ -3,8 +3,14 @@ import SwiftUI
 struct UsageLimitsView: View {
     let client: any FeatureClient
     @Binding var resetCreditStates: [UsageResetCreditTarget: UsageResetCreditState]
+    /// The parent keeps this view mounted behind the usage tab. Only the visible
+    /// tab may add toolbar items.
+    var isActive = true
 
     @State private var environments: [FeatureEnvironmentUsageLimits] = []
+    @State private var groups: [UsageLimitsGroup] = []
+    @State private var pools: [UsageLimitPool] = []
+    @State private var showEnvironments = false
     @State private var hasSnapshot = false
     @State private var isRefreshing = false
     @State private var streamError: String?
@@ -12,8 +18,9 @@ struct UsageLimitsView: View {
     @State private var refreshErrors: [String: String] = [:]
     @State private var now = Date()
     @State private var subscriptionID = UUID()
+    /// Subscriptions start on the first visit and then outlive tab switches.
+    @State private var hasActivated = false
 
-    private var groups: [UsageLimitsGroup] { UsageLimitsPresentation.groups(environments) }
     private var hasLimits: Bool { groups.contains(where: \.hasLimits) }
     private var isWaiting: Bool {
         !hasSnapshot || (!environments.isEmpty && environments.allSatisfy {
@@ -24,6 +31,11 @@ struct UsageLimitsView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
+                Picker("Limits grouping", selection: $showEnvironments) {
+                    Text("Pooled").tag(false)
+                    Text("By environment").tag(true)
+                }
+                .pickerStyle(.segmented)
                 if let streamError { notice(streamError) }
                 if let refreshError { notice(refreshError) }
                 if isRefreshing {
@@ -33,9 +45,9 @@ struct UsageLimitsView: View {
                 }
 
                 if isWaiting, streamError == nil {
-                    Text("Loading subscription limits...")
+                    Text("Loading subscription limits")
                         .font(T3Typography.supporting)
-                        .foregroundStyle(T3Colors.textSecondary)
+                        .foregroundStyle(T3Colors.textTertiary)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 64)
                 } else if environments.isEmpty {
@@ -44,9 +56,24 @@ struct UsageLimitsView: View {
                     } description: {
                         Text("Connect an environment to see subscription limits.")
                     }
-                } else {
+                } else if showEnvironments {
                     ForEach(groups) { group in
                         environmentSection(group)
+                    }
+                } else {
+                    ForEach(environments) { environment in
+                        if let error = refreshErrors[environment.id] {
+                            notice("\(environment.label): Could not refresh limits. \(error)")
+                        }
+                    }
+                    ForEach(Array(UsageLimitPooling.notices(environments).enumerated()), id: \.offset) { _, message in
+                        notice(message)
+                    }
+                    ForEach(pools) { pool in
+                        pooledSection(pool)
+                    }
+                    if pools.isEmpty {
+                        notice("No provider reports subscription limits.")
                     }
                 }
             }
@@ -57,14 +84,20 @@ struct UsageLimitsView: View {
         .scrollIndicators(.hidden)
         .refreshable { await refresh() }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Refresh limits", systemImage: "arrow.clockwise") {
-                    Task { await refresh() }
+            if isActive {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Refresh limits", systemImage: "arrow.clockwise") {
+                        Task { await refresh() }
+                    }
+                    .disabled(isRefreshing)
                 }
-                .disabled(isRefreshing)
             }
         }
-        .task(id: subscriptionID) {
+        .onChange(of: isActive, initial: true) { _, active in
+            if active { hasActivated = true }
+        }
+        .task(id: hasActivated ? subscriptionID : nil) {
+            guard hasActivated else { return }
             let subscription = subscriptionID
             do {
                 for try await snapshot in client.usageLimitsUpdates() {
@@ -79,6 +112,95 @@ struct UsageLimitsView: View {
                 streamError = "Could not load live limits. Refresh to check the latest values."
             }
         }
+    }
+
+    private func pooledSection(_ pool: UsageLimitPool) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(UsageLimitsPresentation.providerLabel(driver: pool.driver))
+                    .font(T3Typography.threadHeading3)
+                Spacer()
+                Text("\(pool.accounts.count) \(pool.accounts.count == 1 ? "account" : "accounts")")
+                    .font(T3Typography.supporting)
+                    .foregroundStyle(T3Colors.textSecondary)
+            }
+            ForEach(pool.windows) { window in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(window.label)
+                        Spacer()
+                        Text("\(window.remainingPercent)% left").monospacedDigit()
+                    }
+                    .font(T3Typography.supporting)
+                    HStack(spacing: 3) {
+                        ForEach(Array(window.columns.enumerated()), id: \.offset) { index, accountWindow in
+                            VStack(alignment: .leading, spacing: 3) {
+                                GeometryReader { geometry in
+                                    if let accountWindow {
+                                        let remaining = UsageLimitsMath.remainingPercent(accountWindow)
+                                        ZStack(alignment: .leading) {
+                                            Rectangle().fill(T3Colors.subtleStrong)
+                                            Rectangle().fill(remaining <= 10 ? T3Colors.danger : T3Colors.textPrimary)
+                                                .frame(width: geometry.size.width * remaining / 100)
+                                        }
+                                    }
+                                }
+                                .frame(height: 6)
+                                Text(accountWindow.map { "\(index + 1): \(Int(UsageLimitsMath.remainingPercent($0)))%" } ?? "\(index + 1): N/A")
+                                    .font(.caption2)
+                                    .foregroundStyle(T3Colors.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            .frame(maxWidth: .infinity)
+                        }
+                    }
+                    HStack {
+                        if let pace = window.pace { Text(pace.label) }
+                        Spacer()
+                        if let reset = window.resets.first(where: { $0.restoresPercent > 0 }) {
+                            Text("+\(reset.restoresPercent)% on \(reset.at.formatted(date: .abbreviated, time: .shortened))")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(T3Colors.textSecondary)
+                }
+                .accessibilityElement(children: .combine)
+            }
+            ForEach(Array(pool.accounts.enumerated()), id: \.element.id) { index, account in
+                DisclosureGroup {
+                    UsageLimitsAccountView(
+                        driver: account.driver, instanceID: account.id,
+                        label: account.label, detail: account.plan,
+                        limits: account.limits, now: now
+                    )
+                    if let credits = account.limits.resetCredits {
+                        if let redeem = account.redeem {
+                            UsageResetCreditsView(
+                                client: client, environmentID: redeem.environmentID,
+                                input: redeem.input, isConnected: redeem.isConnected,
+                                credits: credits, now: now,
+                                state: resetState(environmentID: redeem.target.environmentID, account: redeem.target.account)
+                            )
+                        } else {
+                            notice(UsageLimitsMath.creditSummary(credits, now: now))
+                        }
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("\(index + 1)")
+                            UsageAccountLabel(value: account.label)
+                        }
+                        .font(T3Typography.control)
+                        Text(account.locationLabel)
+                            .font(T3Typography.supporting)
+                            .foregroundStyle(T3Colors.textSecondary)
+                    }
+                }
+                .tint(T3Colors.textPrimary)
+            }
+        }
+        .foregroundStyle(T3Colors.textPrimary)
     }
 
     private func environmentSection(_ group: UsageLimitsGroup) -> some View {
@@ -193,8 +315,10 @@ struct UsageLimitsView: View {
 
     private func receive(_ snapshot: [FeatureEnvironmentUsageLimits]) {
         environments = UsageLimitsPresentation.retainingPendingRows(snapshot, previous: environments)
+        groups = UsageLimitsPresentation.groups(environments)
         hasSnapshot = true
         now = Date()
+        pools = UsageLimitPooling.pools(UsageLimitPooling.accounts(environments), now: now)
         let ids = Set(snapshot.map(\.environmentID))
         refreshErrors = refreshErrors.filter { ids.contains($0.key) }
     }
@@ -206,8 +330,8 @@ struct UsageLimitsView: View {
         refreshErrors = [:]
         defer {
             isRefreshing = false
-            // A failed environment's stream has ended. A manual refresh starts
-            // a new subscription so that environment can report live updates again.
+            // Each environment can end its own stream without throwing from
+            // the combined stream. Refresh must reconnect those failed streams.
             if !Task.isCancelled { subscriptionID = UUID() }
         }
         do {
@@ -296,11 +420,21 @@ private struct UsageLimitWindowView: View {
     let now: Date
 
     var body: some View {
+        if window.resetsAt != nil {
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                content(now: context.date)
+            }
+        } else {
+            content(now: now)
+        }
+    }
+
+    private func content(now: Date) -> some View {
         let remaining = UsageLimitsMath.remainingPercent(window)
         let timeLeft = UsageLimitsMath.elapsedShare(window, now: now).map { 1 - $0 }
         let pace = UsageLimitsMath.pace(window, now: now)
         let resetsIn = UsageLimitsMath.resetsIn(window, now: now)
-        VStack(alignment: .leading, spacing: 4) {
+        return VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 Text(window.label)
                 Spacer(minLength: 8)
@@ -343,9 +477,7 @@ private struct UsageLimitWindowView: View {
     private func barColor(remaining: Double) -> Color {
         if remaining <= 10 { return T3Colors.danger }
         if remaining <= 30 { return T3Colors.warning }
-        return driver == "claudeAgent"
-            ? Color(red: 0.851, green: 0.467, blue: 0.341)
-            : T3Colors.textPrimary
+        return driver == "claudeAgent" ? UsageProviderKind.claudeColor : T3Colors.textPrimary
     }
 }
 

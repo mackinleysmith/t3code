@@ -10,8 +10,6 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let selectedThreadID: String?
     let forceRichRows: Bool
     let hapticsEnabled: Bool
-    let settings: FeatureSettings
-    let pullRequestsByThreadID: [String: HomeThreadPullRequestPresentation]
     let isSnoozedExpanded: Bool
     let isSettledExpanded: Bool
     let isArchiveExpanded: Bool
@@ -27,6 +25,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
     let onSettle: (FeatureThread, Bool, @escaping (Bool) -> Void) -> Void
     let onSnooze: (FeatureThread, Date?) -> Void
     let onPin: (FeatureThread, Bool) -> Void
+    let onArrange: () -> Void
     let onDelete: (FeatureThread) -> Void
     let onPullRequestChange: (String, String, HomeThreadPullRequestPresentation?) -> Void
 
@@ -567,6 +566,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
             }
 
             if !isArchived {
+                actions.append(accessibilityAction("Arrange threads", systemImage: "line.3.horizontal") { coordinator in
+                    coordinator.parent.onArrange()
+                })
                 if thread.canTogglePin {
                     let isPinned = thread.pinnedAt != nil
                     actions.append(accessibilityAction(
@@ -592,9 +594,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                         actions.append(accessibilityAction("Wake", systemImage: "bell") { coordinator in
                             coordinator.parent.onSnooze(thread, nil)
                         })
-                    } else if thread.state != .queued,
-                              thread.state != .waitingForApproval,
-                              thread.state != .waitingForInput {
+                    } else if thread.canSnoozeNow(at: .now) {
                         actions.append(contentsOf: DailyUXSnoozePresets.resolve(now: .now).map { preset in
                             accessibilityAction("Snooze: \(preset.label)", systemImage: "clock") { coordinator in
                                 coordinator.parent.onSnooze(thread, preset.until)
@@ -604,12 +604,14 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 }
             }
 
-            actions.append(accessibilityAction(
-                isArchived ? "Restore" : "Archive",
-                systemImage: isArchived ? "arrow.uturn.backward" : "archivebox"
-            ) { coordinator in
-                coordinator.parent.onArchive(thread, !isArchived)
-            })
+            if isArchived || thread.canArchive {
+                actions.append(accessibilityAction(
+                    isArchived ? "Restore" : "Archive",
+                    systemImage: isArchived ? "arrow.uturn.backward" : "archivebox"
+                ) { coordinator in
+                    coordinator.parent.onArchive(thread, !isArchived)
+                })
+            }
             actions.append(accessibilityAction("Delete thread", systemImage: "trash") { coordinator in
                 coordinator.parent.onDelete(thread)
             })
@@ -713,6 +715,12 @@ struct HomeThreadCollectionView: UIViewRepresentable {
 
             var statusActions: [UIMenuElement] = []
             if !isArchived {
+                statusActions.append(UIAction(
+                    title: "Arrange threads",
+                    image: UIImage(systemName: "line.3.horizontal")
+                ) { [weak self] _ in
+                    self?.parent.onArrange()
+                })
                 if thread.canTogglePin {
                     let isPinned = thread.pinnedAt != nil
                     statusActions.append(
@@ -754,10 +762,7 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                                 self?.parent.onSnooze(thread, preset.until)
                             }
                         }
-                        let snoozeIsDisabled = thread.state == .queued
-                            || thread.state == .waitingForApproval
-                            || thread.state == .waitingForInput
-                        if snoozeIsDisabled {
+                        if !thread.canSnoozeNow(at: .now) {
                             children.forEach { $0.attributes = .disabled }
                         }
                         let snooze = UIMenu(
@@ -775,6 +780,9 @@ struct HomeThreadCollectionView: UIViewRepresentable {
                 image: UIImage(systemName: isArchived ? "arrow.uturn.backward" : "archivebox")
             ) { [weak self] _ in
                 self?.parent.onArchive(thread, !isArchived)
+            }
+            if !isArchived, !thread.canArchive {
+                archive.attributes = .disabled
             }
             let delete = UIAction(
                 title: "Delete thread",
@@ -988,7 +996,7 @@ enum HomeThreadSwipeAction: Equatable {
             }
         } else if isPinned {
             actions.append(.unpin)
-        } else {
+        } else if thread.canArchive {
             actions.append(.archive)
         }
         actions.append(.delete)

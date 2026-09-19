@@ -23,26 +23,9 @@ public protocol FeatureClient: AnyObject {
 
     func addProject(path: String) async throws
     func createThread(projectID: String, title: String?, selection: FeatureSelection?) async throws -> FeatureThread
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
-        workspaceMode: FeatureWorkspaceMode,
-        branch: String?,
-        worktreePath: String?,
-        startFromOrigin: Bool,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread
+    /// Creates the thread and sends its first turn as one idempotent command.
+    /// `identity` lets a retry after an ambiguous network failure reuse the
+    /// same command id so the server does not create a second thread.
     func createThreadAndSend(
         projectID: String,
         prompt: String,
@@ -54,7 +37,8 @@ public protocol FeatureClient: AnyObject {
         worktreePath: String?,
         startFromOrigin: Bool,
         attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?
     ) async throws -> FeatureThread
     func listWorkspaceBranches(
         projectID: String,
@@ -69,39 +53,44 @@ public protocol FeatureClient: AnyObject {
     func setThreadSettled(id: String, settled: Bool) async throws
     func setThreadSnoozed(id: String, until: Date?) async throws
     func setThreadPinned(id: String, pinned: Bool) async throws
+    /// Commits a drag reorder: `orderedIDs` is the thread's displayed section
+    /// order after the drop. Returns the order-key assignments the server
+    /// confirmed; an empty result means the move was unavailable (capability,
+    /// connectivity, or an unwritable neighbor).
+    @discardableResult
+    func reorderThread(
+        id: String,
+        section: FeatureThreadOrderSection,
+        orderedIDs: [String]
+    ) async throws -> [FeatureThreadOrderAssignment]
+    func setThreadPullRequest(id: String, url: String, linked: Bool) async throws
     func setRuntimeMode(id: String, mode: FeatureRuntimeMode) async throws
     func setInteractionMode(id: String, mode: FeatureInteractionMode) async throws
     func deleteThread(id: String) async throws
 
-    func loadThread(id: String) async throws -> FeatureThreadDetail
+    /// `fresh` bypasses the client's warm cache and reads from the server.
     func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail
     func loadEarlierThreadTurns(id: String) async throws -> FeatureThreadDetail?
     func releaseThread(id: String)
-    func sendMessage(threadID: String, text: String, selection: FeatureSelection?) async throws
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        attachments: [FeatureUploadAttachment]
-    ) async throws
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
-    ) async throws
+    /// Sends one turn. `runtimeMode` is the mode that was active when the user
+    /// sent it, so a retry keeps the original permission level.
     func sendMessage(
         threadID: String,
         text: String,
         selection: FeatureSelection?,
         runtimeMode: FeatureRuntimeMode,
         attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
+        identity: FeatureSubmissionIdentity,
+        context: OrchestrationMessageContext?
     ) async throws
     func cancelTurn(threadID: String) async throws
+    func canRewindConversation(threadID: String, messageID: String) -> Bool
+    /// Returns only after provider history is rewound. Attachment bytes are copied first.
+    func rewindConversation(
+        threadID: String, messageID: String,
+        prepareRecovery: @MainActor (FeatureRevertedMessage) async throws -> Void
+    ) async throws
     func resolveApproval(id: String, decision: FeatureApprovalDecision) async throws
-    func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws
     func resolveUserInput(
         id: String, answers: [String: FeatureInputAnswer],
         attachmentsByQuestionID: [String: [FeatureUploadAttachment]]
@@ -111,7 +100,11 @@ public protocol FeatureClient: AnyObject {
     func saveSettings(_ settings: FeatureSettings) async throws
     func serverPreferences(environmentID: String) async throws -> ServerSettingsSnapshot
     func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws
+    func updateProjectPreferences(projectID: String, change: ServerProjectSettingChange) async throws
+    func projectPreferences(projectID: String) async throws -> FeatureProjectPreferences
     func sharedPreferenceMismatches(environmentID: String) -> [String]
+    func gitHubRoutingPermission(environmentID: String) async throws -> GitHubRoutingPermission
+    func setGitHubRoutingPermission(environmentID: String, permission: GitHubRoutingPermission) async throws
     func refreshProviders(environmentID: String) async throws -> [FeatureProvider]
     func refreshWorkspaceProviders(environmentID: String, cwd: String, instanceID: String) async throws -> [FeatureProvider]
     func providerSetup(environmentID: String, instanceID: String, action: ProviderSetupAction) async throws -> ProviderSetupEvent
@@ -122,8 +115,6 @@ public protocol FeatureClient: AnyObject {
         change: FeatureAutomaticSettlementChange
     ) async throws -> FeatureAutomaticSettlementSettings
 
-    func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage]
-    func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage]
     func usageSummaryUpdates(
         _ input: UsageSummaryInput,
         refreshPricing: Bool
@@ -245,39 +236,46 @@ public protocol FeatureClient: AnyObject {
 }
 
 public extension FeatureClient {
+    func gitHubRoutingPermission(environmentID: String) async throws -> GitHubRoutingPermission { .off }
+    func setGitHubRoutingPermission(environmentID: String, permission: GitHubRoutingPermission) async throws {
+        throw FeatureCapabilityUnavailable("GitHub sharing")
+    }
+    func setThreadPullRequest(id: String, url: String, linked: Bool) async throws {
+        throw FeatureCapabilityUnavailable("Pull request linking")
+    }
+    func canRewindConversation(threadID: String, messageID: String) -> Bool { false }
+
+    func rewindConversation(
+        threadID: String, messageID: String,
+        prepareRecovery: @MainActor (FeatureRevertedMessage) async throws -> Void
+    ) async throws {
+        throw FeatureCapabilityUnavailable("Conversation rewind")
+    }
+
     func serverPreferences(environmentID: String) async throws -> ServerSettingsSnapshot {
         throw FeatureCapabilityUnavailable("Server preferences")
     }
     func updateServerPreferences(environmentID: String, change: ServerSettingsChange) async throws {
         throw FeatureCapabilityUnavailable("Server preferences")
     }
+    func updateProjectPreferences(projectID: String, change: ServerProjectSettingChange) async throws {
+        throw FeatureCapabilityUnavailable("Project preferences")
+    }
+    func projectPreferences(projectID: String) async throws -> FeatureProjectPreferences {
+        throw FeatureCapabilityUnavailable("Project preferences")
+    }
     func sharedPreferenceMismatches(environmentID: String) -> [String] { [] }
 
-    func loadThread(id: String, fresh: Bool) async throws -> FeatureThreadDetail {
-        try await loadThread(id: id)
-    }
-
-    func usageSummaries(_ input: UsageSummaryInput, refreshPricing: Bool) async throws -> [FeatureEnvironmentUsage] {
-        try await usageSummaries(input)
+    /// Warm-cache read. The requirement takes `fresh:`; this is the common call.
+    func loadThread(id: String) async throws -> FeatureThreadDetail {
+        try await loadThread(id: id, fresh: false)
     }
 
     func usageSummaryUpdates(
         _ input: UsageSummaryInput,
         refreshPricing: Bool
     ) -> AsyncThrowingStream<[FeatureEnvironmentUsage], Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let result = try await usageSummaries(input, refreshPricing: refreshPricing)
-                    try Task.checkCancellation()
-                    continuation.yield(result)
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
+        AsyncThrowingStream { $0.finish() }
     }
 
     func usageLimitsUpdates() -> AsyncThrowingStream<[FeatureEnvironmentUsageLimits], Error> {
@@ -360,9 +358,6 @@ public extension FeatureClient {
         throw FeatureCapabilityUnavailable("Automatic settlement settings")
     }
     func addProject(path: String) async throws {}
-    func usageSummaries(_ input: UsageSummaryInput) async throws -> [FeatureEnvironmentUsage] {
-        []
-    }
     func pullRequestLists(_ input: PullRequestListInput) async throws
         -> [FeaturePullRequestEnvironmentList]
     {
@@ -441,33 +436,18 @@ public extension FeatureClient {
         nil
     }
     func releaseThread(id: String) {}
-    func resolveUserInput(id: String, answers: [String: FeatureInputAnswer]) async throws {}
-
-    func resolveUserInput(
-        id: String, answers: [String: FeatureInputAnswer],
-        attachmentsByQuestionID: [String: [FeatureUploadAttachment]]
-    ) async throws {
-        guard attachmentsByQuestionID.values.allSatisfy(\.isEmpty) else {
-            throw FeatureCapabilityUnavailable("Question attachments")
-        }
-        try await resolveUserInput(id: id, answers: answers)
-    }
 
     func dismissUserInput(id: String) async throws {
         throw FeatureCapabilityUnavailable("Question dismissal")
     }
-
-    /// Keeps simple text-only callers source-compatible while the typed API
-    /// preserves multi-select answers as arrays.
-    func resolveUserInput(id: String, answers: [String: String]) async throws {
-        try await resolveUserInput(
-            id: id,
-            answers: answers.mapValues(FeatureInputAnswer.text)
-        )
-    }
     func setThreadSettled(id: String, settled: Bool) async throws {}
     func setThreadSnoozed(id: String, until: Date?) async throws {}
     func setThreadPinned(id: String, pinned: Bool) async throws {}
+    func reorderThread(
+        id: String,
+        section: FeatureThreadOrderSection,
+        orderedIDs: [String]
+    ) async throws -> [FeatureThreadOrderAssignment] { [] }
     func setRuntimeMode(id: String, mode: FeatureRuntimeMode) async throws {}
     func setInteractionMode(id: String, mode: FeatureInteractionMode) async throws {}
     func loadReviewFileContents(
@@ -490,129 +470,6 @@ public extension FeatureClient {
         try await NewTaskWorkspaceDefaults.selectBranch(branch, mode: mode) { _ in
             throw FeatureCapabilityUnavailable("Branch checkout")
         }
-    }
-
-    /// Legacy clients still create in the current checkout. Native clients
-    /// override this overload to prepare worktrees atomically with the first turn.
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
-        workspaceMode: FeatureWorkspaceMode,
-        branch: String?,
-        worktreePath: String?,
-        startFromOrigin: Bool,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread {
-        try await createThreadAndSend(
-            projectID: projectID,
-            prompt: prompt,
-            selection: selection,
-            runtimeMode: runtimeMode,
-            interactionMode: interactionMode,
-            attachments: attachments
-        )
-    }
-
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
-        attachments: [FeatureUploadAttachment]
-    ) async throws -> FeatureThread {
-        let thread = try await createThread(
-            projectID: projectID,
-            title: prompt,
-            selection: selection
-        )
-        try await sendMessage(
-            threadID: thread.id,
-            text: prompt,
-            selection: selection,
-            attachments: attachments
-        )
-        return thread
-    }
-
-    /// Clients that understand stable command identities override this method.
-    /// The compatibility path remains functional but cannot guarantee
-    /// idempotence across a process death after an ambiguous network failure.
-    func createThreadAndSend(
-        projectID: String,
-        prompt: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        interactionMode: FeatureInteractionMode,
-        workspaceMode: FeatureWorkspaceMode,
-        branch: String?,
-        worktreePath: String?,
-        startFromOrigin: Bool,
-        attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
-    ) async throws -> FeatureThread {
-        try await createThreadAndSend(
-            projectID: projectID,
-            prompt: prompt,
-            selection: selection,
-            runtimeMode: runtimeMode,
-            interactionMode: interactionMode,
-            workspaceMode: workspaceMode,
-            branch: branch,
-            worktreePath: worktreePath,
-            startFromOrigin: startFromOrigin,
-            attachments: attachments
-        )
-    }
-
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        attachments: [FeatureUploadAttachment]
-    ) async throws {
-        guard attachments.isEmpty else {
-            throw FeatureCapabilityUnavailable("Image attachments")
-        }
-        try await sendMessage(threadID: threadID, text: text, selection: selection)
-    }
-
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
-    ) async throws {
-        try await sendMessage(
-            threadID: threadID,
-            text: text,
-            selection: selection,
-            attachments: attachments
-        )
-    }
-
-    /// Durable submissions carry the modes that were active when the user
-    /// sent them. Older clients can ignore them, while native retries preserve
-    /// the original permission instead of reading a later thread value.
-    func sendMessage(
-        threadID: String,
-        text: String,
-        selection: FeatureSelection?,
-        runtimeMode: FeatureRuntimeMode,
-        attachments: [FeatureUploadAttachment],
-        identity: FeatureSubmissionIdentity
-    ) async throws {
-        try await sendMessage(
-            threadID: threadID,
-            text: text,
-            selection: selection,
-            attachments: attachments,
-            identity: identity
-        )
     }
 
     func listFiles(threadID: String, path: String?) async throws -> [FeatureFileEntry] {

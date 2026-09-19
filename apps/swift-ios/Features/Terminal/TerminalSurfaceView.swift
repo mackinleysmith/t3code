@@ -3,6 +3,49 @@ import QuartzCore
 import SwiftUI
 import UIKit
 
+/// Ghostty's worker threads wake the host to drain its bounded app mailbox.
+/// Coalesce wakeups without polling or touching the native app off the main thread.
+private final class GhosttyAppEventLoop: @unchecked Sendable {
+    private let lock = NSLock()
+    private var scheduled = false
+    @MainActor var app: ghostty_app_t?
+
+    @MainActor init() {}
+
+    func wakeup() {
+        lock.lock()
+        guard !scheduled else { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        DispatchQueue.main.async { [self] in
+            lock.lock()
+            scheduled = false
+            lock.unlock()
+            if let app { ghostty_app_tick(app) }
+        }
+    }
+}
+
+private final class GhosttyRetirementFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var delivered = false
+    private let completion: @MainActor () -> Void
+
+    init(completion: @escaping @MainActor () -> Void) { self.completion = completion }
+
+    func complete() {
+        lock.lock()
+        guard !delivered else { lock.unlock(); return }
+        delivered = true
+        lock.unlock()
+        DispatchQueue.main.async { [self] in
+            completion()
+            // The native callback owns a retain until the I/O thread stops.
+            Unmanaged.passUnretained(self).release()
+        }
+    }
+}
+
 struct GhosttyTerminalSurface: UIViewRepresentable {
     @SwiftUI.Environment(\.colorScheme) private var colorScheme
     let terminalKey: String
@@ -17,6 +60,7 @@ struct GhosttyTerminalSurface: UIViewRepresentable {
     let onResize: (Int, Int) -> Void
     let onClear: () -> Void
     let onFontSizeStep: (Int) -> Void
+    var onAttachOutput: ((String) -> Void)? = nil
 
     func makeUIView(context _: Context) -> GhosttyTerminalView {
         let view = GhosttyTerminalView()
@@ -39,6 +83,7 @@ struct GhosttyTerminalSurface: UIViewRepresentable {
         view.onResize = onResize
         view.onClear = onClear
         view.onFontSizeStep = onFontSizeStep
+        view.onAttachOutput = onAttachOutput
         view.terminalKey = terminalKey
         view.lifecycleVersion = lifecycleVersion
         view.fontSize = fontSize
@@ -180,6 +225,47 @@ enum TerminalText {
                 return
             }
             output.append(character)
+        }
+    }
+}
+
+/// Ghostty accepts appended bytes. Compare UTF-8 directly so unchanged buffers
+/// do not require a walk over Swift characters. A trimmed or replaced snapshot
+/// resets terminal content without rebuilding its native surface.
+enum TerminalBufferDelta: Equatable {
+    case append(Data)
+    case replace(Data)
+
+    struct Applied: Equatable {
+        private(set) var bytes = Data()
+
+        init() {}
+
+        init(buffer: String) {
+            bytes = Data(buffer.utf8)
+        }
+
+        mutating func apply(_ delta: TerminalBufferDelta) {
+            switch delta {
+            case .append(let data): bytes.append(data)
+            case .replace(let data): bytes = data
+            }
+        }
+    }
+
+    static func compute(previous: Applied, next: String) -> TerminalBufferDelta {
+        var next = next
+        return next.withUTF8 { bytes in
+            guard !previous.bytes.isEmpty else { return .append(Data(buffer: bytes)) }
+            return previous.bytes.withUnsafeBytes { oldBytes in
+                guard bytes.count >= oldBytes.count,
+                      let oldBase = oldBytes.baseAddress,
+                      let nextBase = bytes.baseAddress,
+                      memcmp(oldBase, nextBase, oldBytes.count) == 0 else {
+                    return .replace(Data(buffer: bytes))
+                }
+                return .append(Data(buffer: UnsafeBufferPointer(rebasing: bytes[oldBytes.count...])))
+            }
         }
     }
 }
@@ -562,10 +648,10 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     private static let minimumVerticalScrollStepPoints: CGFloat = 18
     private static let verticalScrollStepMultiplier: CGFloat = 1.15
     private static let darkThemeConfig = """
-    background = #0a0a0a
+    background = #000000
     foreground = #adadb1
     cursor-color = #009fff
-    cursor-text = #0a0a0a
+    cursor-text = #000000
     cursor-style-blink = false
     palette = 0=#141415
     palette = 1=#ff2e3f
@@ -607,18 +693,22 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     palette = 14=#08c0ef
     palette = 15=#c6c6c8
     """
+    /// Full reset, drop scrollback, clear, home. Puts an existing surface in
+    /// the same state as a new one without rebuilding it.
+    private static let resetSequence = Data("\u{1B}c\u{1B}[3J\u{1B}[2J\u{1B}[H".utf8)
 
     var onInput: ((String) -> Void)?
     var onPaste: ((String) -> Void)?
     var onResize: ((Int, Int) -> Void)?
     var onClear: (() -> Void)?
     var onFontSizeStep: ((Int) -> Void)?
+    var onAttachOutput: ((String) -> Void)?
 
     var isDarkMode = true {
         didSet {
             guard oldValue != isDarkMode else { return }
             applyChromeAppearance()
-            refreshSurface()
+            refreshSurfaceIfCreated()
         }
     }
 
@@ -640,13 +730,10 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
 
     var buffer = "" {
         didSet {
-            guard oldValue != buffer else { return }
-            applyRemoteBuffer(buffer)
-            if UIAccessibility.isVoiceOverRunning {
-                terminalViewport.accessibilityValue = TerminalText.plainText(
-                    from: String(buffer.suffix(8_192))
-                )
-            }
+            guard applyRemoteBuffer(buffer), UIAccessibility.isVoiceOverRunning else { return }
+            terminalViewport.accessibilityValue = TerminalText.plainText(
+                from: String(buffer.suffix(8_192))
+            )
         }
     }
 
@@ -654,7 +741,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         didSet {
             guard oldValue != fontSize else { return }
             inputField.font = .monospacedSystemFont(ofSize: max(fontSize, 13), weight: .regular)
-            refreshSurface()
+            refreshSurfaceIfCreated()
         }
     }
 
@@ -704,14 +791,17 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     private var lastViewportSize: CGSize = .zero
     private var lastContentScale: CGFloat = 0
     private var lastReportedGrid: (columns: Int, rows: Int)?
-    private var lastAppliedBuffer = ""
+    private var appliedBuffer = TerminalBufferDelta.Applied()
     private var isReplayingBuffer = false
     private var pendingVerticalScrollPoints: CGFloat = 0
     private var hasAutoFocused = false
     private var app: ghostty_app_t?
+    private var eventLoop: GhosttyAppEventLoop?
     private var surface: ghostty_surface_t?
     private var isCreatingSurface = false
     private var surfaceCreationFailed = false
+    private var isTornDown = false
+    private var teardownTask: Task<Void, Never>?
 
     init() {
         super.init(frame: .zero)
@@ -813,6 +903,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
 
     override func didMoveToWindow() {
         super.didMoveToWindow()
+        if let surface { ghostty_surface_set_occlusion(surface, window != nil) }
         guard window != nil, isRunning, !hasAutoFocused else { return }
         hasAutoFocused = true
         DispatchQueue.main.async { [weak self] in self?.requestKeyboardFocus() }
@@ -854,12 +945,19 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
             let clear = UIAction(title: "Clear", image: UIImage(systemName: "eraser")) { [weak self] _ in
                 self?.onClear?()
             }
-            return UIMenu(children: [copy, paste, clear])
+            var actions = [copy, paste, clear]
+            if self.onAttachOutput != nil {
+                actions.insert(UIAction(title: "Add output to message", image: UIImage(systemName: "text.bubble")) { [weak self] _ in
+                    guard let self else { return }
+                    self.onAttachOutput?(TerminalText.plainText(from: self.buffer))
+                }, at: 1)
+            }
+            return UIMenu(children: actions)
         }
     }
 
     private func createSurfaceIfPossible() {
-        guard surface == nil, app == nil, !isCreatingSurface, !surfaceCreationFailed else { return }
+        guard !isTornDown, surface == nil, app == nil, !isCreatingSurface, !surfaceCreationFailed else { return }
         guard terminalViewport.bounds.width > 0, terminalViewport.bounds.height > 0 else { return }
         guard GhosttyRuntime.ensureInitialized() else {
             surfaceCreationFailed = true
@@ -869,11 +967,22 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         isCreatingSurface = true
         defer { isCreatingSurface = false }
 
+        let eventLoop = GhosttyAppEventLoop()
         var runtimeConfig = ghostty_runtime_config_s(
-            userdata: Unmanaged.passUnretained(self).toOpaque(),
+            userdata: Unmanaged.passUnretained(eventLoop).toOpaque(),
             supports_selection_clipboard: false,
-            wakeup_cb: { _ in },
-            action_cb: { _, _, _ in false },
+            wakeup_cb: { userdata in
+                guard let userdata else { return }
+                Unmanaged<GhosttyAppEventLoop>.fromOpaque(userdata).takeUnretainedValue().wakeup()
+            },
+            action_cb: { _, target, action in
+                // App ticks deliver render requests after queued output is parsed.
+                guard action.tag == GHOSTTY_ACTION_RENDER,
+                      target.tag == GHOSTTY_TARGET_SURFACE,
+                      let surface = target.target.surface else { return false }
+                ghostty_surface_draw(surface)
+                return true
+            },
             read_clipboard_cb: { _, _, _, _, _, _ in GHOSTTY_CLIPBOARD_READ_UNSUPPORTED },
             confirm_read_clipboard_cb: { _, _, _, _ in },
             write_clipboard_cb: { _, _, _, _, _ in },
@@ -909,6 +1018,8 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         }
 
         app = createdApp
+        eventLoop.app = createdApp
+        self.eventLoop = eventLoop
         surface = createdSurface
         let ghosttyColorScheme =
             isDarkMode
@@ -916,6 +1027,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
             : GHOSTTY_COLOR_SCHEME_LIGHT
         ghostty_app_set_color_scheme(createdApp, ghosttyColorScheme)
         ghostty_surface_set_color_scheme(createdSurface, ghosttyColorScheme)
+        if inputField.isFirstResponder { ghostty_surface_set_focus(createdSurface, true) }
         setupWriteCallback()
         resizeSurface()
         feedBuffer(buffer)
@@ -923,7 +1035,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
 
     private func resetSurface() {
         destroySurface()
-        lastAppliedBuffer = ""
+        appliedBuffer = TerminalBufferDelta.Applied()
         lastViewportSize = .zero
         lastContentScale = 0
         lastReportedGrid = nil
@@ -932,10 +1044,9 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func applyChromeAppearance() {
-        let background =
-            isDarkMode
-            ? UIColor(red: 10 / 255, green: 10 / 255, blue: 10 / 255, alpha: 1)
-            : UIColor(red: 242 / 255, green: 242 / 255, blue: 247 / 255, alpha: 1)
+        let background = T3Colors.uiBackground.resolvedColor(
+            with: UITraitCollection(userInterfaceStyle: isDarkMode ? .dark : .light)
+        )
         backgroundColor = background
         terminalViewport.backgroundColor = background
         accessoryView.overrideUserInterfaceStyle = isDarkMode ? .dark : .light
@@ -955,68 +1066,119 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         keyboardButton.configuration = keyboardConfiguration
     }
 
-    private func refreshSurface() {
+    /// Ghostty reads font size and theme when a surface is created, so those
+    /// changes rebuild the surface. Before the first layout there is nothing to
+    /// rebuild, and creation picks up the current values.
+    private func refreshSurfaceIfCreated() {
+        guard surface != nil else { return }
         resetSurface()
         createSurfaceIfPossible()
     }
 
-    func tearDown() {
+    @discardableResult
+    func tearDown() -> Task<Void, Never>? {
+        guard !isTornDown else { return teardownTask }
+        isTornDown = true
         onInput = nil
         onPaste = nil
         onResize = nil
         onClear = nil
         onFontSizeStep = nil
-        destroySurface()
+        onAttachOutput = nil
+        inputField.resignFirstResponder()
+        teardownTask = destroySurface()
+        return teardownTask
     }
 
-    private func destroySurface() {
-        if let surface {
-            ghostty_surface_set_write_callback(surface, nil, nil)
-            ghostty_surface_free(surface)
-        }
-        if let app { ghostty_app_free(app) }
+    @discardableResult
+    private func destroySurface() -> Task<Void, Never>? {
+        let surface = self.surface
+        let app = self.app
+        let eventLoop = self.eventLoop
+        guard surface != nil || app != nil else { return nil }
+        self.surface = nil
+        self.app = nil
+        self.eventLoop = nil
+        // Remove the renderer's display callbacks from the view before a
+        // dismissal layout or keyboard callback can try to use it again.
         terminalViewport.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        surface = nil
-        app = nil
+        if let surface {
+            ghostty_surface_set_focus(surface, false)
+            ghostty_surface_set_occlusion(surface, false)
+        }
+        return Task { @MainActor [self] in
+            if let surface {
+                await withCheckedContinuation { continuation in
+                    let fence = GhosttyRetirementFence {
+                        eventLoop?.app = nil
+                        ghostty_surface_free(surface)
+                        if let app { ghostty_app_free(app) }
+                        continuation.resume()
+                    }
+                    // Callback changes and writes use the same FIFO as feed_data.
+                    // A write to this replacement callback proves all earlier output
+                    // was parsed. Swallow it here: it must never reach the remote PTY.
+                    // Keep ticking the app while waiting, or its bounded mailbox can
+                    // block the I/O thread that surface_free needs to join.
+                    ghostty_surface_set_write_callback(surface, { userdata, _, _ in
+                        guard let userdata else { return }
+                        Unmanaged<GhosttyRetirementFence>.fromOpaque(userdata).takeUnretainedValue().complete()
+                    }, Unmanaged.passRetained(fence).toOpaque())
+                    " ".withCString { ghostty_surface_text(surface, $0, 1) }
+                }
+            } else {
+                eventLoop?.app = nil
+                if let app { ghostty_app_free(app) }
+            }
+            withExtendedLifetime((self, eventLoop)) {}
+        }
     }
 
-    private func applyRemoteBuffer(_ newBuffer: String) {
+    /// Feeds the surface whatever `newBuffer` adds on top of what it already
+    /// shows. Returns false when nothing changed.
+    @discardableResult
+    private func applyRemoteBuffer(_ newBuffer: String) -> Bool {
         guard surface != nil else {
             createSurfaceIfPossible()
-            return
+            return true
         }
-        guard newBuffer != lastAppliedBuffer else { return }
-
-        if newBuffer.isEmpty {
-            feedData(Data("\u{1B}[2J\u{1B}[H".utf8))
-            lastAppliedBuffer = ""
-            return
+        let delta = TerminalBufferDelta.compute(previous: appliedBuffer, next: newBuffer)
+        appliedBuffer.apply(delta)
+        switch delta {
+        case .append(let data):
+            guard !data.isEmpty else { return false }
+            feedData(data)
+        case .replace(let data):
+            replay {
+                feedData(Self.resetSequence)
+                feedData(data)
+            }
         }
-
-        if newBuffer.hasPrefix(lastAppliedBuffer) {
-            feedData(Data(newBuffer.dropFirst(lastAppliedBuffer.count).utf8))
-            lastAppliedBuffer = newBuffer
-            return
-        }
-
-        resetSurface()
-        createSurfaceIfPossible()
+        return true
     }
 
+    /// Feeds the whole buffer into a fresh surface.
     private func feedBuffer(_ value: String) {
+        appliedBuffer = TerminalBufferDelta.Applied(buffer: value)
         guard !value.isEmpty else { return }
+        var value = value
+        replay { value.withUTF8 { feedBytes($0) } }
+    }
+
+    /// Replayed history must not echo terminal query replies back to the host.
+    private func replay(_ body: () -> Void) {
         isReplayingBuffer = true
         defer { isReplayingBuffer = false }
-        feedData(Data(value.utf8))
-        lastAppliedBuffer = value
+        body()
     }
 
     private func feedData(_ data: Data) {
-        guard let surface, !data.isEmpty else { return }
-        data.withUnsafeBytes { bytes in
-            guard let pointer = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            ghostty_surface_feed_data(surface, pointer, bytes.count)
-        }
+        data.withUnsafeBytes { feedBytes($0.bindMemory(to: UInt8.self)) }
+    }
+
+    private func feedBytes(_ bytes: UnsafeBufferPointer<UInt8>) {
+        guard let surface, let pointer = bytes.baseAddress, !bytes.isEmpty else { return }
+        ghostty_surface_feed_data(surface, pointer, bytes.count)
         redrawSurface()
     }
 
@@ -1034,10 +1196,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func resizeSurface() {
-        guard let surface else {
-            emitEstimatedResize()
-            return
-        }
+        guard let surface else { return }
 
         let scale = contentScaleFactor
         let width = UInt32(max(floor(terminalViewport.bounds.width * scale), 1))
@@ -1059,20 +1218,12 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
         emitGhosttyResize()
     }
 
+    /// Reports the grid only once the surface has measured it, so the host
+    /// never sees a guessed size followed by the real one.
     private func emitGhosttyResize() {
-        guard let surface else {
-            emitEstimatedResize()
-            return
-        }
+        guard let surface else { return }
         let size = ghostty_surface_size(surface)
         emitResize(columns: max(1, Int(size.columns)), rows: max(1, Int(size.rows)))
-    }
-
-    private func emitEstimatedResize() {
-        guard bounds.width > 0, bounds.height > 0 else { return }
-        let columns = max(20, min(400, Int(bounds.width / max(fontSize * 0.62, 1))))
-        let rows = max(5, min(200, Int(bounds.height / max(fontSize * 1.35, 1))))
-        emitResize(columns: columns, rows: rows)
     }
 
     private func emitResize(columns: Int, rows: Int) {
@@ -1087,7 +1238,7 @@ final class GhosttyTerminalView: UIView, UITextFieldDelegate, UIContextMenuInter
     }
 
     private func requestKeyboardFocus() {
-        guard window != nil, isRunning else { return }
+        guard !isTornDown, window != nil, isRunning else { return }
         inputField.becomeFirstResponder()
         if let surface { ghostty_surface_set_focus(surface, true) }
         if let app { ghostty_app_keyboard_changed(app) }

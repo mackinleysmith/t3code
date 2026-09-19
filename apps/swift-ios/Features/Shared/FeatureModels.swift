@@ -6,6 +6,10 @@ public struct FeatureConnection: Sendable, Equatable, Codable {
         case connecting
         case connected
         case reconnecting
+        /// The server rejected the saved credential (expired, revoked, or
+        /// restored onto a new device). Retrying cannot fix it; only pairing
+        /// again can.
+        case needsPairing
     }
 
     public var state: State
@@ -142,6 +146,9 @@ public struct FeatureProject: Identifiable, Sendable, Equatable, Hashable, Codab
     public var createdAt: String?
     public var updatedAt: String?
     public var projectIcon: ProjectIconOverride? = nil
+    public var defaultWorkspaceMode: FeatureWorkspaceMode? = nil
+    public var newWorktreesStartFromOrigin: Bool? = nil
+    public var supportsProjectSettingsOverrides: Bool? = nil
 
     public init(
         id: String,
@@ -268,6 +275,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var branch: String?
     public var worktreePath: String?
     public var linkedPullRequest: ThreadLinkedPullRequest?
+    public var pullRequests: [ThreadPullRequestLink]?
     public var branchPullRequest: ThreadLinkedPullRequest?
     public var createdAt: Date
     public var updatedAt: Date
@@ -287,11 +295,17 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     public var snoozedUntil: Date?
     public var snoozedAt: Date?
     public var pinnedAt: Date?
+    /// User-arranged position in the pinned block. Shared with web and
+    /// React Native; keyless pins sort after keyed ones by creation date.
+    public var pinOrderKey: String?
     public var supportsSettlement: Bool?
     public var supportsSnooze: Bool?
     public var supportsPinning: Bool?
+    public var supportsPinReorder: Bool?
+    public var supportsActiveReorder: Bool?
     public var supportsTitleRegeneration: Bool?
     public var supportsPullRequestLinking: Bool?
+    public var supportsMultiplePullRequests: Bool?
     /// True while the server is generating a new title. Derived from the wire
     /// snapshot only, the same way the web and React Native clients do it.
     public var isRegeneratingTitle: Bool
@@ -313,6 +327,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         branch: String? = nil,
         worktreePath: String? = nil,
         linkedPullRequest: ThreadLinkedPullRequest? = nil,
+        pullRequests: [ThreadPullRequestLink]? = nil,
         branchPullRequest: ThreadLinkedPullRequest? = nil,
         createdAt: Date = .now,
         updatedAt: Date = .now,
@@ -332,11 +347,15 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         snoozedUntil: Date? = nil,
         snoozedAt: Date? = nil,
         pinnedAt: Date? = nil,
+        pinOrderKey: String? = nil,
         supportsSettlement: Bool? = nil,
         supportsSnooze: Bool? = nil,
         supportsPinning: Bool? = nil,
+        supportsPinReorder: Bool? = nil,
+        supportsActiveReorder: Bool? = nil,
         supportsTitleRegeneration: Bool? = nil,
         supportsPullRequestLinking: Bool? = nil,
+        supportsMultiplePullRequests: Bool? = nil,
         isRegeneratingTitle: Bool = false,
         attentionAt: Date? = nil,
         workingStartedAt: Date? = nil,
@@ -355,6 +374,7 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.branch = branch
         self.worktreePath = worktreePath
         self.linkedPullRequest = linkedPullRequest
+        self.pullRequests = pullRequests
         self.branchPullRequest = branchPullRequest
         self.createdAt = createdAt
         self.updatedAt = updatedAt
@@ -374,11 +394,15 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         self.snoozedUntil = snoozedUntil
         self.snoozedAt = snoozedAt
         self.pinnedAt = pinnedAt
+        self.pinOrderKey = pinOrderKey
         self.supportsSettlement = supportsSettlement
         self.supportsSnooze = supportsSnooze
         self.supportsPinning = supportsPinning
+        self.supportsPinReorder = supportsPinReorder
+        self.supportsActiveReorder = supportsActiveReorder
         self.supportsTitleRegeneration = supportsTitleRegeneration
         self.supportsPullRequestLinking = supportsPullRequestLinking
+        self.supportsMultiplePullRequests = supportsMultiplePullRequests
         self.isRegeneratingTitle = isRegeneratingTitle
         self.attentionAt = attentionAt
         self.workingStartedAt = workingStartedAt
@@ -389,7 +413,13 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
     }
 
     public var effectivePullRequest: ThreadLinkedPullRequest? {
-        linkedPullRequest ?? branchPullRequest
+        if let pullRequests, !pullRequests.isEmpty {
+            return ThreadPullRequests.current(pullRequests).map {
+                ThreadLinkedPullRequest(projectId: projectID, repository: $0.repository,
+                                        number: $0.number, url: $0.url)
+            }
+        }
+        return linkedPullRequest ?? branchPullRequest
     }
 
     /// Missing capabilities mean unsupported. Existing states remain reversible
@@ -406,6 +436,61 @@ public struct FeatureThread: Identifiable, Sendable, Equatable, Hashable, Codabl
         snoozedUntil != nil || supportsSnooze == true
     }
 
+    /// The server refuses to archive a thread with live work. Hide the action
+    /// on those rows instead of offering it and then reporting the refusal.
+    public var canArchive: Bool {
+        switch state {
+        case .queued, .working, .monitoring, .waitingForApproval, .waitingForInput:
+            false
+        case .idle, .completed, .failed:
+            true
+        }
+    }
+
+    /// Mirrors the server's `thread.snooze` guard and client-runtime
+    /// `canSnooze`: a raised hand or a turn that is still being adopted blocks
+    /// snooze. The session lifecycle state on its own does not.
+    public func canSnoozeNow(at now: Date) -> Bool {
+        guard canToggleSnooze else { return false }
+        if state == .waitingForApproval || state == .waitingForInput { return false }
+        return !hasQueuedTurnStart(at: now)
+    }
+
+}
+
+/// The thread-list section a drag reorder arranges. Pinned threads write
+/// `pinOrderKey`; active threads write `activeOrderKey`.
+public enum FeatureThreadOrderSection: String, Sendable, Equatable {
+    case pinned
+    case active
+}
+
+/// One `orderKey` write needed to realize a move. A move between keyed
+/// neighbors produces a single assignment on the moved thread; a move next to
+/// keyless threads rewrites the whole section (see ThreadOrderPlanner).
+public struct FeatureThreadOrderAssignment: Sendable, Equatable {
+    /// Feature-scoped thread id (`FeatureScopedID.thread`), so assignments can
+    /// span environments.
+    public let threadID: String
+    public let orderKey: String
+
+    public init(threadID: String, orderKey: String) {
+        self.threadID = threadID
+        self.orderKey = orderKey
+    }
+}
+
+/// A spread rewrite that wrote some assignments before a later environment
+/// rejected its write. Callers apply `confirmed` — those rows are arranged on
+/// their servers — and surface `underlying` as the move's failure.
+public struct FeatureThreadMovePartialError: Error, Sendable {
+    public let confirmed: [FeatureThreadOrderAssignment]
+    public let underlying: Error
+
+    public init(confirmed: [FeatureThreadOrderAssignment], underlying: Error) {
+        self.confirmed = confirmed
+        self.underlying = underlying
+    }
 }
 
 public enum FeatureMessageRole: String, Sendable, Codable {
@@ -423,6 +508,7 @@ public enum FeatureMessageState: String, Sendable, Codable {
 }
 
 public struct FeatureMessageAttachment: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public var source: PastedTextAttachmentSource?
     public let id: String
     public var name: String
     public var mimeType: String
@@ -438,7 +524,8 @@ public struct FeatureMessageAttachment: Identifiable, Sendable, Equatable, Hasha
         mimeType: String,
         sizeBytes: Int,
         url: URL? = nil,
-        previewData: Data? = nil
+        previewData: Data? = nil,
+        source: PastedTextAttachmentSource? = nil
     ) {
         self.id = id
         self.name = name
@@ -446,10 +533,12 @@ public struct FeatureMessageAttachment: Identifiable, Sendable, Equatable, Hasha
         self.sizeBytes = sizeBytes
         self.url = url
         self.previewData = previewData
+        self.source = source
     }
 }
 
 public struct FeatureUploadAttachment: Sendable, Equatable {
+    public var source: PastedTextAttachmentSource?
     public let id: UUID
     private var inlineData: Data?
     public var ownedFile: FeatureOwnedAttachmentFile?
@@ -462,7 +551,8 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
         data: Data,
         name: String,
         mimeType: String,
-        uploadedReference: FeatureUploadedAttachmentReference? = nil
+        uploadedReference: FeatureUploadedAttachmentReference? = nil,
+        source: PastedTextAttachmentSource? = nil
     ) {
         self.id = id
         inlineData = data
@@ -470,6 +560,7 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
         self.name = name
         self.mimeType = mimeType
         self.uploadedReference = uploadedReference
+        self.source = source
     }
 
     public init(
@@ -477,7 +568,8 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
         ownedFile: FeatureOwnedAttachmentFile,
         name: String,
         mimeType: String,
-        uploadedReference: FeatureUploadedAttachmentReference? = nil
+        uploadedReference: FeatureUploadedAttachmentReference? = nil,
+        source: PastedTextAttachmentSource? = nil
     ) {
         self.id = id
         inlineData = nil
@@ -485,6 +577,7 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
         self.name = name
         self.mimeType = mimeType
         self.uploadedReference = uploadedReference
+        self.source = source
     }
 
     public init(_ draft: FeatureDraftAttachment) {
@@ -494,6 +587,7 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
         name = draft.filename
         mimeType = draft.mimeType
         uploadedReference = draft.uploadedReference
+        source = draft.source
     }
 
     public var data: Data {
@@ -510,6 +604,7 @@ public struct FeatureUploadAttachment: Sendable, Equatable {
 }
 
 public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codable {
+    public var context: OrchestrationMessageContext?
     public let id: String
     public var role: FeatureMessageRole
     public var text: String
@@ -532,7 +627,8 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
         attachments: [FeatureMessageAttachment] = [],
         workLogImagePaths: [String]? = nil,
         activeWorkLabel: String? = nil,
-        updatedAt: Date? = nil
+        updatedAt: Date? = nil,
+        context: OrchestrationMessageContext? = nil
     ) {
         self.id = id
         self.role = role
@@ -544,6 +640,7 @@ public struct FeatureMessage: Identifiable, Sendable, Equatable, Hashable, Codab
         self.attachments = attachments
         self.workLogImagePaths = workLogImagePaths
         self.activeWorkLabel = activeWorkLabel
+        self.context = context
     }
 }
 
@@ -1113,6 +1210,11 @@ public struct FeatureSettings: Sendable, Equatable, Codable {
     }
 }
 
+public struct FeatureProjectPreferences: Sendable {
+    public let environment: ServerSettingsSnapshot
+    public let effective: ServerSettingsSnapshot
+}
+
 public struct FeatureEnvironmentPreferences: Sendable, Equatable, Codable {
     public enum ProjectGroupingMode: String, Sendable, Equatable, Codable {
         case repository
@@ -1296,7 +1398,9 @@ public enum FeatureThreadSyncState: Sendable, Equatable {
 
 public enum FeatureEvent: Sendable {
     case snapshot(FeatureSnapshot)
-    case connection(FeatureConnection)
+    /// Active environment connection change. `environmentID` lets the model
+    /// patch that environment's row without installing a whole snapshot.
+    case connection(FeatureConnection, environmentID: String? = nil)
     case thread(FeatureThread)
     case threadRemoved(id: String)
     case detail(FeatureThreadDetail)

@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		C10000000000000000000012 /* SubscriptionUsageSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = C40000000000000000000012 /* SubscriptionUsageSnapshot.swift */; };
+		C10000000000000000000013 /* SubscriptionUsageSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = C40000000000000000000012 /* SubscriptionUsageSnapshot.swift */; };
+		C10000000000000000000014 /* SubscriptionUsageWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = C40000000000000000000013 /* SubscriptionUsageWidget.swift */; };
 		B10000000000000000000001 /* ClerkKit in Frameworks */ = {isa = PBXBuildFile; productRef = B30000000000000000000001 /* ClerkKit */; };
 		B10000000000000000000002 /* ClerkKitUI in Frameworks */ = {isa = PBXBuildFile; productRef = B30000000000000000000002 /* ClerkKitUI */; };
 		D10000000000000000000001 /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = D40000000000000000000001 /* GhosttyKit.xcframework */; };
@@ -192,6 +195,7 @@
 				C40000000000000000000001 /* AgentActivityAttributes.swift */,
 				C40000000000000000000002 /* SharedContainer.swift */,
 				C40000000000000000000003 /* TaskWidgetSnapshot.swift */,
+				C40000000000000000000012 /* SubscriptionUsageSnapshot.swift */,
 				C40000000000000000000004 /* ShareInbox.swift */,
 				C40000000000000000000005 /* T3Code.entitlements */,
 			);
@@ -204,6 +208,7 @@
 				C40000000000000000000006 /* T3CodeWidgets.swift */,
 				C40000000000000000000007 /* AgentActivityWidget.swift */,
 				C40000000000000000000008 /* RecentTasksWidget.swift */,
+				C40000000000000000000013 /* SubscriptionUsageWidget.swift */,
 				C40000000000000000000009 /* Info.plist */,
 				C4000000000000000000000A /* T3CodeWidgets.entitlements */,
 			);
@@ -438,6 +443,7 @@
 				C10000000000000000000001 /* AgentActivityAttributes.swift in Sources */,
 				C10000000000000000000002 /* SharedContainer.swift in Sources */,
 				C10000000000000000000003 /* TaskWidgetSnapshot.swift in Sources */,
+				C10000000000000000000012 /* SubscriptionUsageSnapshot.swift in Sources */,
 				C10000000000000000000004 /* ShareInbox.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -457,6 +463,8 @@
 				C10000000000000000000005 /* AgentActivityAttributes.swift in Sources */,
 				C10000000000000000000006 /* SharedContainer.swift in Sources */,
 				C10000000000000000000007 /* TaskWidgetSnapshot.swift in Sources */,
+				C10000000000000000000013 /* SubscriptionUsageSnapshot.swift in Sources */,
+				C10000000000000000000014 /* SubscriptionUsageWidget.swift in Sources */,
 				C10000000000000000000008 /* T3CodeWidgets.swift in Sources */,
 				C10000000000000000000009 /* AgentActivityWidget.swift in Sources */,
 				C1000000000000000000000A /* RecentTasksWidget.swift in Sources */,
@@ -617,7 +625,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Shared/T3Code.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 48;
+				CURRENT_PROJECT_VERSION = 51;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -674,7 +682,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Shared/T3Code.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 48;
+				CURRENT_PROJECT_VERSION = 51;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "T3 Code SwiftUI";
@@ -764,7 +772,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Widgets/T3CodeWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 48;
+				CURRENT_PROJECT_VERSION = 51;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Widgets/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -795,7 +803,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Widgets/T3CodeWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 48;
+				CURRENT_PROJECT_VERSION = 51;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Widgets/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -828,7 +836,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Share/T3CodeShare.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 48;
+				CURRENT_PROJECT_VERSION = 51;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Share/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -859,7 +867,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_ENTITLEMENTS = Extensions/Share/T3CodeShare.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 48;
+				CURRENT_PROJECT_VERSION = 51;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Extensions/Share/Info.plist;
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
@@ -961,6 +969,8 @@
 /* End XCSwiftPackageProductDependency section */
 
 /* Begin PBXFileReference section */
+		C40000000000000000000012 /* SubscriptionUsageSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubscriptionUsageSnapshot.swift; sourceTree = "<group>"; };
+		C40000000000000000000013 /* SubscriptionUsageWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubscriptionUsageWidget.swift; sourceTree = "<group>"; };
 		A40000000000000000000001 /* T3 Code.app */ = {
 			isa = PBXFileReference;
 			explicitFileType = wrapper.application;

@@ -17,6 +17,7 @@ public struct SettingsView: View {
                     workspaceSection
                     appSection
                     activitySection
+                    supportSection
                     aboutSection
                 }
                 .padding(.vertical, 20)
@@ -75,6 +76,14 @@ public struct SettingsView: View {
                 .accessibilityLabel("Environments")
                 .accessibilityValue(environmentAccessibilityValue)
                 .accessibilityHint("Manage saved environments")
+                settingsDivider
+                NavigationLink {
+                    ProjectsSettingsView(model: model)
+                } label: {
+                    SettingsNavigationRow(title: "Projects", systemImage: "folder")
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settings-projects")
                 settingsDivider
                 NavigationLink {
                     ProvidersSettingsView(model: model)
@@ -152,17 +161,39 @@ public struct SettingsView: View {
         }
     }
 
-    private var aboutSection: some View {
-        SettingsSection(title: "About", footer: "Version \(appVersionLabel)") {
-            Link(destination: URL(string: "https://github.com/pingdotgg/t3code")!) {
-                SettingsNavigationRow(
-                    title: "Source code",
-                    systemImage: "chevron.left.forwardslash.chevron.right",
-                    trailingSystemImage: "arrow.up.right"
-                )
+    private var supportSection: some View {
+        SettingsSection(title: "Support") {
+            NavigationLink {
+                SettingsDiagnosticsView()
+            } label: {
+                SettingsNavigationRow(title: "Diagnostics", systemImage: "stethoscope")
             }
             .buttonStyle(.plain)
-            .accessibilityHint("Opens GitHub in your browser")
+            .accessibilityIdentifier("settings-diagnostics")
+        }
+    }
+
+    private var aboutSection: some View {
+        SettingsSection(title: "About", footer: "Version \(appVersionLabel)") {
+            VStack(spacing: 0) {
+                Link(destination: URL(string: "https://github.com/pingdotgg/t3code")!) {
+                    SettingsNavigationRow(
+                        title: "Source code",
+                        systemImage: "chevron.left.forwardslash.chevron.right",
+                        trailingSystemImage: "arrow.up.right"
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Opens GitHub in your browser")
+                settingsDivider
+                NavigationLink {
+                    SettingsLicensesView()
+                } label: {
+                    SettingsNavigationRow(title: "Open source licenses", systemImage: "doc.text")
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settings-licenses")
+            }
         }
     }
 

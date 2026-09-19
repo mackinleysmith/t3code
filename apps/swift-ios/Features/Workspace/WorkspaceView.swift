@@ -6,6 +6,7 @@ struct FeatureWorkspaceNavigationRequest: Equatable, Sendable {
         case thread(id: String)
         case project(id: String)
         case newTask(projectID: String?)
+        case usageLimits
     }
 
     let id: UUID
@@ -55,6 +56,9 @@ public struct WorkspaceView: View {
     @State private var showingAddProject = false
     @State private var showingEnvironments = false
     @State private var showingSettings = false
+    @State private var showingThreadArrangement = false
+    @State private var settingsProject: FeatureProject?
+    @State private var showingUsageLimits = false
     @State private var renamingThread: FeatureThread?
     @State private var deletingThread: FeatureThread?
     @State private var renameTitle = ""
@@ -63,71 +67,18 @@ public struct WorkspaceView: View {
     @State private var homePresentationCache = HomePresentationCache()
     @FocusState private var isSearchFocused: Bool
 
-    public init(
-        model: FeatureRootModel,
-        submitNewTask: ((NewTaskRequest) async -> FeatureThread?)? = nil,
-        submitMessage: ((FeatureMessageSubmission) async -> Bool)? = nil
-    ) {
-        self.init(
-            model: model,
-            navigationRequest: nil,
-            onNavigationRequestConsumed: { _ in },
-            submitNewTask: submitNewTask,
-            submitMessage: submitMessage
-        )
-    }
-
+    /// Both submit paths go through `FeatureRootModel`, which owns the outbox
+    /// and optimistic rows. Views never call the client to send a turn.
     init(
         model: FeatureRootModel,
-        navigationRequest: FeatureWorkspaceNavigationRequest?,
-        onNavigationRequestConsumed: @escaping @MainActor (UUID) -> Void,
-        submitNewTask: ((NewTaskRequest) async -> FeatureThread?)? = nil,
-        submitMessage: ((FeatureMessageSubmission) async -> Bool)? = nil
+        navigationRequest: FeatureWorkspaceNavigationRequest? = nil,
+        onNavigationRequestConsumed: @escaping @MainActor (UUID) -> Void = { _ in }
     ) {
         self.model = model
         self.navigationRequest = navigationRequest
         self.onNavigationRequestConsumed = onNavigationRequestConsumed
-        self.submitNewTask = submitNewTask ?? { request in
-            do {
-                let thread = try await model.client.createThreadAndSend(
-                    projectID: request.projectID,
-                    prompt: request.trimmedPrompt,
-                    selection: request.selection,
-                    runtimeMode: request.runtimeMode,
-                    interactionMode: request.interactionMode,
-                    workspaceMode: request.workspaceMode,
-                    branch: request.branch,
-                    worktreePath: request.worktreePath,
-                    startFromOrigin: request.startFromOrigin,
-                    attachments: request.attachments.map(\.uploadValue)
-                )
-                await model.reload()
-                return thread
-            } catch {
-                return nil
-            }
-        }
-        self.submitMessage = submitMessage ?? { submission in
-            if submission.attachments.isEmpty {
-                return await model.sendMessage(
-                    threadID: submission.threadID,
-                    text: submission.text,
-                    selection: submission.selection
-                )
-            }
-            do {
-                try await model.client.sendMessage(
-                    threadID: submission.threadID,
-                    text: submission.text,
-                    selection: submission.selection,
-                    attachments: submission.attachments.map(\.uploadValue)
-                )
-                _ = await model.detail(for: submission.threadID, force: true)
-                return true
-            } catch {
-                return false
-            }
-        }
+        self.submitNewTask = { request in await model.startTask(request) }
+        self.submitMessage = { submission in await model.sendMessage(submission) }
     }
 
     public var body: some View {
@@ -157,6 +108,9 @@ public struct WorkspaceView: View {
         .sheet(isPresented: $showingAddProject) {
             AddProjectView(model: model)
         }
+        .sheet(item: $settingsProject) { project in
+            ProjectPreferencesSheet(model: model, projectID: project.id)
+        }
         .sheet(isPresented: $showingEnvironments) {
             NavigationStack {
                 ConnectionsView(model: model)
@@ -170,8 +124,22 @@ public struct WorkspaceView: View {
             .onAppear { model.setConnectionManagementPresented(true) }
             .onDisappear { model.setConnectionManagementPresented(false) }
         }
+        .sheet(isPresented: $showingUsageLimits) {
+            NavigationStack {
+                UsageView(client: model.client, initiallyShowsLimits: true)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("Done") { showingUsageLimits = false }
+                        }
+                    }
+            }
+            .preferredColorScheme(.dark)
+        }
         .sheet(isPresented: $showingSettings) {
             SettingsView(model: model)
+        }
+        .sheet(isPresented: $showingThreadArrangement) {
+            ThreadArrangementView(model: model)
         }
         .alert(
             "Rename thread",
@@ -261,6 +229,7 @@ public struct WorkspaceView: View {
         let presentation = homePresentationCache.presentation(
             snapshot: model.snapshot,
             revision: model.homePresentationRevision,
+            rowRevision: model.threadRowRevision,
             query: searchText,
             projectID: selectedProjectID,
             now: sidebarBoundaryNow,
@@ -276,8 +245,6 @@ public struct WorkspaceView: View {
                 selectedThreadID: threadSelection.highlightedID,
                 forceRichRows: dynamicTypeSize.isAccessibilitySize,
                 hapticsEnabled: model.snapshot.settings.hapticsEnabled,
-                settings: model.snapshot.settings,
-                pullRequestsByThreadID: model.pullRequestsByThreadID,
                 isSnoozedExpanded: isSnoozedExpanded,
                 isSettledExpanded: isSettledExpanded,
                 isArchiveExpanded: isArchiveExpanded,
@@ -306,6 +273,7 @@ public struct WorkspaceView: View {
                 onPin: { thread, pinned in
                     Task { await model.setPinned(thread.id, pinned: pinned) }
                 },
+                onArrange: { showingThreadArrangement = true },
                 onDelete: { thread in
                     deletingThread = thread
                 },
@@ -545,6 +513,12 @@ public struct WorkspaceView: View {
                         }
                     }
                 }
+                if let selectedProject {
+                    Divider()
+                    Button("Project settings", systemImage: "gearshape") {
+                        settingsProject = selectedProject
+                    }
+                }
             } label: {
                 HStack(spacing: 7) {
                     Image(systemName: "folder")
@@ -610,9 +584,7 @@ public struct WorkspaceView: View {
     private var nextSidebarBoundary: Date? {
         DailyUXSidebarRefresh.nextBoundary(
             for: model.snapshot.threads,
-            after: max(sidebarBoundaryNow, .now),
-            settings: model.snapshot.settings,
-            pullRequestsByThreadID: model.pullRequestsByThreadID
+            after: max(sidebarBoundaryNow, .now)
         )
     }
 
@@ -661,6 +633,12 @@ public struct WorkspaceView: View {
     private func consumeNavigationRequest() {
         guard let navigationRequest else { return }
         switch navigationRequest.destination {
+        case .usageLimits:
+            dismissTransientPresentations()
+            Task { @MainActor in
+                await Task.yield()
+                showingUsageLimits = true
+            }
         case let .thread(id):
             guard model.snapshot.threads.contains(where: { $0.id == id }) else { return }
             dismissTransientPresentations()
@@ -685,10 +663,13 @@ public struct WorkspaceView: View {
     }
 
     private func dismissTransientPresentations() {
+        settingsProject = nil
         showingNewTask = false
         showingAddProject = false
         showingEnvironments = false
         showingSettings = false
+        showingUsageLimits = false
+        showingThreadArrangement = false
         renamingThread = nil
     }
 
@@ -703,12 +684,6 @@ public struct WorkspaceView: View {
     }
 }
 
-private extension FeatureDraftAttachment {
-    var uploadValue: FeatureUploadAttachment {
-        FeatureUploadAttachment(self)
-    }
-}
-
 struct HomePresentation {
     let pinned: [FeatureThread]
     let active: [FeatureThread]
@@ -717,6 +692,50 @@ struct HomePresentation {
     let archived: [FeatureThread]
     let searchResults: [FeatureThread]
     let rowContexts: [String: HomeThreadRowContext]
+
+    private init(
+        pinned: [FeatureThread],
+        active: [FeatureThread],
+        snoozed: [FeatureThread],
+        settled: [FeatureThread],
+        archived: [FeatureThread],
+        searchResults: [FeatureThread],
+        rowContexts: [String: HomeThreadRowContext]
+    ) {
+        self.pinned = pinned
+        self.active = active
+        self.snoozed = snoozed
+        self.settled = settled
+        self.archived = archived
+        self.searchResults = searchResults
+        self.rowContexts = rowContexts
+    }
+
+    /// Same shelves and order, latest thread values. O(n) dictionary lookup
+    /// instead of the grouping and sorting passes in `init(snapshot:)`.
+    func refreshingRows(from snapshot: FeatureSnapshot) -> HomePresentation {
+        let byID = snapshot.threads.reduce(into: [String: FeatureThread]()) { $0[$1.id] = $1 }
+        let contextChanged = (pinned + active + snoozed + settled + archived).contains { previous in
+            guard let next = byID[previous.id] else { return false }
+            return previous.providerID != next.providerID
+                || previous.sessionProviderID != next.sessionProviderID
+                || previous.providerName != next.providerName
+                || previous.environmentID != next.environmentID
+                || previous.environmentName != next.environmentName
+        }
+        func refresh(_ threads: [FeatureThread]) -> [FeatureThread] {
+            threads.map { byID[$0.id] ?? $0 }
+        }
+        return HomePresentation(
+            pinned: refresh(pinned),
+            active: refresh(active),
+            snoozed: refresh(snoozed),
+            settled: refresh(settled),
+            archived: refresh(archived),
+            searchResults: refresh(searchResults),
+            rowContexts: contextChanged ? HomeThreadRowContext.index(snapshot: snapshot) : rowContexts
+        )
+    }
 
     init(
         snapshot: FeatureSnapshot,
@@ -758,8 +777,12 @@ struct HomePresentation {
     }
 }
 
+/// Grouping and sorting run only when a shelf or order input changes
+/// (`homePresentationRevision`). A streaming turn advances `threadRowRevision`
+/// many times a second; that path swaps in the latest thread values by id and
+/// keeps the computed order.
 @MainActor
-private final class HomePresentationCache {
+final class HomePresentationCache {
     private struct Key: Equatable {
         let revision: UInt64
         let query: String
@@ -768,11 +791,13 @@ private final class HomePresentationCache {
     }
 
     private var cachedKey: Key?
+    private var cachedRowRevision: UInt64?
     private var cachedPresentation: HomePresentation?
 
     func presentation(
         snapshot: FeatureSnapshot,
         revision: UInt64,
+        rowRevision: UInt64,
         query: String,
         projectID: String?,
         now: Date,
@@ -785,7 +810,16 @@ private final class HomePresentationCache {
             now: now
         )
         if cachedKey == key, let cachedPresentation {
-            return cachedPresentation
+            if cachedRowRevision == rowRevision {
+                return cachedPresentation
+            }
+            // Search also matches previews, which can change without moving a row.
+            if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let refreshed = cachedPresentation.refreshingRows(from: snapshot)
+                self.cachedPresentation = refreshed
+                cachedRowRevision = rowRevision
+                return refreshed
+            }
         }
 
         let presentation = HomePresentation(
@@ -796,6 +830,7 @@ private final class HomePresentationCache {
             pullRequestsByThreadID: pullRequestsByThreadID
         )
         cachedKey = key
+        cachedRowRevision = rowRevision
         cachedPresentation = presentation
         return presentation
     }
@@ -947,16 +982,32 @@ struct HomeThreadPullRequestPresentation: Equatable {
         case open
         case merged
         case closed
+        case draft
     }
 
     let number: Int
     let state: State
     let updatedAt: Date?
+    var count = 1
+    var isStack = false
 
-    var label: String { "#\(number)" }
+    var label: String {
+        count > 1 ? (isStack ? "\(count) PRs" : "#\(number) +\(count - 1)") : "#\(number)"
+    }
 
     var accessibilityLabel: String {
-        "Pull request #\(number), \(state.rawValue)"
+        "\(count > 1 ? "\(count) pull requests" : "Pull request #\(number)"), \(state.rawValue)"
+    }
+
+    static func resolve(links: [ThreadPullRequestLink]) -> Self? {
+        let visible = ThreadPullRequests.visible(links)
+        guard let current = ThreadPullRequests.current(visible) else { return nil }
+        let state: State = visible.allSatisfy { $0.snapshot?.state == .open && $0.snapshot?.isDraft == true }
+            ? .draft : visible.contains(where: \.isOpen) ? .open
+            : visible.allSatisfy { $0.snapshot?.state == .merged } ? .merged : .closed
+        return Self(number: current.number, state: state,
+                    updatedAt: parseDate(current.snapshot?.updatedAt), count: visible.count,
+                    isStack: visible.count > 1 && ThreadPullRequests.chains(visible).count == 1)
     }
 
     static func resolve(
@@ -967,6 +1018,7 @@ struct HomeThreadPullRequestPresentation: Equatable {
               !branch.isEmpty,
               status.branch == branch,
               let pullRequest = status.pullRequest,
+              PullRequestState(rawValue: pullRequest.state.lowercased()) != nil,
               let state = State(rawValue: pullRequest.state.lowercased()) else {
             return nil
         }
@@ -983,6 +1035,8 @@ struct HomeThreadPullRequestPresentation: Equatable {
     ) -> Self? {
         guard detail.number == linkedPullRequest.number,
               detail.repository.caseInsensitiveCompare(linkedPullRequest.repository) == .orderedSame,
+              URL(string: detail.url)?.host?.lowercased() == URL(string: linkedPullRequest.url)?.host?.lowercased(),
+              URL(string: detail.url)?.port == URL(string: linkedPullRequest.url)?.port,
               let state = State(rawValue: detail.state.rawValue) else {
             return nil
         }
@@ -1004,6 +1058,9 @@ struct HomeThreadPullRequestPresentation: Equatable {
 extension FeatureThread {
     var pullRequestObservationIdentity: String? {
         let environment = environmentID ?? ""
+        if let pullRequests, !pullRequests.isEmpty {
+            return [id, environment, projectID, String(pullRequests.hashValue)].joined(separator: "\u{0}")
+        }
         if let linkedPullRequest = effectivePullRequest {
             return [
                 id,
@@ -1011,6 +1068,7 @@ extension FeatureThread {
                 projectID,
                 linkedPullRequest.projectId,
                 linkedPullRequest.repository.lowercased(),
+                linkedPullRequest.url,
                 String(linkedPullRequest.number),
             ].joined(separator: "\u{0}")
         }
@@ -1230,6 +1288,8 @@ struct FeatureThreadRow: View {
             "wifi"
         case .disconnected:
             "wifi.slash"
+        case .needsPairing:
+            "key.slash"
         case .connected, nil:
             "server.rack"
         }
@@ -1239,7 +1299,7 @@ struct FeatureThreadRow: View {
         switch context.connectionState {
         case .connecting, .reconnecting:
             T3Colors.warning.opacity(0.78)
-        case .disconnected:
+        case .disconnected, .needsPairing:
             T3Colors.danger.opacity(0.78)
         case .connected, nil:
             T3Colors.textTertiary
@@ -1275,6 +1335,12 @@ struct FeatureThreadRow: View {
 
     @MainActor
     private func observePullRequest() async {
+        if let links = thread.pullRequests, !links.isEmpty {
+            let next = HomeThreadPullRequestPresentation.resolve(links: links)
+            pullRequest = next
+            onPullRequestChange(next)
+            return
+        }
         guard pullRequestObservationID != nil,
               let projectFaviconClient else {
             pullRequest = nil
@@ -1290,7 +1356,8 @@ struct FeatureThreadRow: View {
                 reference: PullRequestRef(
                     projectId: linked.projectId,
                     repository: linked.repository,
-                    number: linked.number
+                    number: linked.number,
+                    host: ThreadPullRequests.authority(of: linked.url)
                 )
             )
             while !Task.isCancelled {
@@ -1326,7 +1393,7 @@ struct FeatureThreadRow: View {
 
     private func pullRequestIndicator(_ pullRequest: HomeThreadPullRequestPresentation) -> some View {
         HStack(spacing: 3) {
-            Image(systemName: "arrow.triangle.pull")
+            Image(systemName: pullRequest.isStack ? "square.stack.3d.up" : "arrow.triangle.pull")
                 .font(.system(size: 10, weight: .semibold))
             Text(pullRequest.label)
                 .font(T3Typography.homeMetadata.monospacedDigit().weight(.medium))
@@ -1342,6 +1409,7 @@ struct FeatureThreadRow: View {
         case .open: T3Colors.success
         case .merged: T3Colors.syntaxKeyword
         case .closed: T3Colors.danger
+        case .draft: T3Colors.textSecondary
         }
     }
 

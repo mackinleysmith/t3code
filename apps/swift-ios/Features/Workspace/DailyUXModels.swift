@@ -8,6 +8,7 @@ public struct FeatureDraftAttachment: Identifiable, Sendable, Equatable {
     public var filename: String
     public var mimeType: String
     public var uploadedReference: FeatureUploadedAttachmentReference?
+    public var source: PastedTextAttachmentSource?
 
     public init(
         id: UUID = UUID(),
@@ -15,7 +16,8 @@ public struct FeatureDraftAttachment: Identifiable, Sendable, Equatable {
         thumbnailData: Data? = nil,
         filename: String,
         mimeType: String,
-        uploadedReference: FeatureUploadedAttachmentReference? = nil
+        uploadedReference: FeatureUploadedAttachmentReference? = nil,
+        source: PastedTextAttachmentSource? = nil
     ) {
         self.id = id
         inlineData = data
@@ -24,6 +26,7 @@ public struct FeatureDraftAttachment: Identifiable, Sendable, Equatable {
         self.filename = filename
         self.mimeType = mimeType
         self.uploadedReference = uploadedReference
+        self.source = source
     }
 
     public init(
@@ -32,7 +35,8 @@ public struct FeatureDraftAttachment: Identifiable, Sendable, Equatable {
         thumbnailData: Data? = nil,
         filename: String,
         mimeType: String,
-        uploadedReference: FeatureUploadedAttachmentReference? = nil
+        uploadedReference: FeatureUploadedAttachmentReference? = nil,
+        source: PastedTextAttachmentSource? = nil
     ) {
         self.id = id
         inlineData = nil
@@ -41,6 +45,7 @@ public struct FeatureDraftAttachment: Identifiable, Sendable, Equatable {
         self.filename = filename
         self.mimeType = mimeType
         self.uploadedReference = uploadedReference
+        self.source = source
     }
 
     /// Kept for image-only callers. File-backed attachments return empty data
@@ -59,6 +64,7 @@ public struct FeatureDraftAttachment: Identifiable, Sendable, Equatable {
 }
 
 public struct NewTaskRequest: Sendable, Equatable {
+    public var context: OrchestrationMessageContext?
     public var projectID: String
     public var prompt: String
     public var selection: FeatureSelection?
@@ -80,7 +86,8 @@ public struct NewTaskRequest: Sendable, Equatable {
         branch: String? = nil,
         worktreePath: String? = nil,
         startFromOrigin: Bool = true,
-        attachments: [FeatureDraftAttachment] = []
+        attachments: [FeatureDraftAttachment] = [],
+        context: OrchestrationMessageContext? = nil
     ) {
         self.projectID = projectID
         self.prompt = prompt
@@ -92,6 +99,7 @@ public struct NewTaskRequest: Sendable, Equatable {
         self.worktreePath = workspaceMode == .local ? Self.nonEmpty(worktreePath) : nil
         self.startFromOrigin = workspaceMode == .worktree && startFromOrigin
         self.attachments = attachments
+        self.context = context
     }
 
     public var trimmedPrompt: String {
@@ -108,6 +116,7 @@ public struct NewTaskRequest: Sendable, Equatable {
 }
 
 public struct FeatureMessageSubmission: Sendable, Equatable {
+    public var context: OrchestrationMessageContext?
     public var threadID: String
     public var text: String
     public var selection: FeatureSelection?
@@ -117,12 +126,14 @@ public struct FeatureMessageSubmission: Sendable, Equatable {
         threadID: String,
         text: String,
         selection: FeatureSelection?,
-        attachments: [FeatureDraftAttachment] = []
+        attachments: [FeatureDraftAttachment] = [],
+        context: OrchestrationMessageContext? = nil
     ) {
         self.threadID = threadID
         self.text = text
         self.selection = selection
         self.attachments = attachments
+        self.context = context
     }
 }
 
@@ -453,8 +464,13 @@ enum DailyUXCreationContext {
         guard let environmentID = project?.environmentID else {
             return FeatureEnvironmentPreferences()
         }
-        return snapshot.preferencesByEnvironment?[environmentID]
+        var preferences = snapshot.preferencesByEnvironment?[environmentID]
             ?? FeatureEnvironmentPreferences()
+        if let mode = project?.defaultWorkspaceMode { preferences.defaultWorkspaceMode = mode }
+        if let startFromOrigin = project?.newWorktreesStartFromOrigin {
+            preferences.newWorktreesStartFromOrigin = startFromOrigin
+        }
+        return preferences
     }
 }
 
@@ -697,16 +713,6 @@ struct DailyUXSidebarIndex {
     let settled: [FeatureThread]
     let searchResults: [FeatureThread]
 
-    var needsInput: [FeatureThread] {
-        active.filter {
-            $0.state == .waitingForApproval || $0.state == .waitingForInput
-        }
-    }
-
-    var failed: [FeatureThread] {
-        active.filter { $0.state == .failed }
-    }
-
     init(
         snapshot: FeatureSnapshot,
         query: String,
@@ -720,32 +726,9 @@ struct DailyUXSidebarIndex {
         }
         let available = visible.filter { !$0.isEffectivelySnoozed(at: now) }
 
-        pinned = available
-            .filter {
-                $0.pinnedAt != nil
-                    && !($0.supportsSettlement == true && $0.isEffectivelySettled())
-            }
-            .sorted(by: Self.creationOrder)
+        pinned = Self.orderedSection(visible, section: .pinned, now: now)
 
-        active = available
-            .filter {
-                $0.pinnedAt == nil
-                    && !($0.supportsSettlement == true && $0.isEffectivelySettled())
-            }
-            .sorted { lhs, rhs in
-                switch (lhs.activeOrderKey, rhs.activeOrderKey) {
-                case (.none, .some): return true
-                case (.some, .none): return false
-                case let (.some(left), .some(right)):
-                    return left == right ? Self.activeIdentityOrder(lhs, rhs) : left < right
-                case (.none, .none): break
-                }
-                let leftAnchor = max(lhs.createdAt, lhs.unsettledAt ?? lhs.createdAt)
-                let rightAnchor = max(rhs.createdAt, rhs.unsettledAt ?? rhs.createdAt)
-                return leftAnchor == rightAnchor
-                    ? Self.activeIdentityOrder(lhs, rhs)
-                    : leftAnchor > rightAnchor
-            }
+        active = Self.orderedSection(visible, section: .active, now: now)
 
         snoozed = visible
             .filter { $0.isEffectivelySnoozed(at: now) }
@@ -777,14 +760,65 @@ struct DailyUXSidebarIndex {
         )
     }
 
-    private static func creationOrder(_ lhs: FeatureThread, _ rhs: FeatureThread) -> Bool {
-        if lhs.createdAt != rhs.createdAt {
-            return lhs.createdAt > rhs.createdAt
-        }
-        return lhs.id < rhs.id
+    /// The pinned or active list in display order, independent of project
+    /// filtering and search — the same canonical section React Native plans
+    /// `thread.pin.reorder` / `thread.active.reorder` against, so a reorder
+    /// means the same thing no matter which rows are on screen.
+    static func orderedSection(
+        _ threads: [FeatureThread],
+        section: FeatureThreadOrderSection,
+        now: Date
+    ) -> [FeatureThread] {
+        threads
+            .filter { thread in
+                !thread.isArchived
+                    && !thread.isEffectivelySnoozed(at: now)
+                    && !(thread.supportsSettlement == true && thread.isEffectivelySettled())
+                    && (thread.pinnedAt != nil) == (section == .pinned)
+            }
+            .sorted(by: section == .pinned ? pinnedOrder : activeOrder)
     }
 
-    private static func activeIdentityOrder(_ lhs: FeatureThread, _ rhs: FeatureThread) -> Bool {
+    /// Keyed rows hold their user-arranged order first; threads pinned by
+    /// clients that predate reordering keep static creation order below them
+    /// (`sortPinnedThreadsByOrderKey` in client-runtime).
+    private static func pinnedOrder(_ lhs: FeatureThread, _ rhs: FeatureThread) -> Bool {
+        switch (lhs.pinOrderKey, rhs.pinOrderKey) {
+        case let (.some(left), .some(right)):
+            return left == right ? identityOrder(lhs, rhs) : left < right
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        case (.none, .none):
+            return lhs.createdAt == rhs.createdAt
+                ? identityOrder(lhs, rhs)
+                : lhs.createdAt > rhs.createdAt
+        }
+    }
+
+    /// New and reopened threads lead the active list. Arranged threads follow
+    /// their saved keys; activity leaves both groups in place
+    /// (`sortActiveThreadsByOrderKey` in client-runtime).
+    private static func activeOrder(_ lhs: FeatureThread, _ rhs: FeatureThread) -> Bool {
+        switch (lhs.activeOrderKey, rhs.activeOrderKey) {
+        case (.none, .some): return true
+        case (.some, .none): return false
+        case let (.some(left), .some(right)):
+            return left == right ? identityOrder(lhs, rhs) : left < right
+        case (.none, .none): break
+        }
+        let leftAnchor = max(lhs.createdAt, lhs.unsettledAt ?? lhs.createdAt)
+        let rightAnchor = max(rhs.createdAt, rhs.unsettledAt ?? rhs.createdAt)
+        return leftAnchor == rightAnchor
+            ? identityOrder(lhs, rhs)
+            : leftAnchor > rightAnchor
+    }
+
+    /// Wire id first, then environment: thread ids are only unique within an
+    /// environment, and merged sections need both parts or two clients could
+    /// render equal-key threads in stream-arrival order.
+    private static func identityOrder(_ lhs: FeatureThread, _ rhs: FeatureThread) -> Bool {
         let leftID = lhs.wireID ?? lhs.id
         let rightID = rhs.wireID ?? rhs.id
         if leftID != rightID { return leftID < rightID }
@@ -806,13 +840,77 @@ struct DailyUXSidebarIndex {
         }
         return candidates.filter { thread in
             let project = projectByID[thread.projectID]
-            return [
+            return ([
                 thread.title,
                 thread.preview ?? "",
                 project?.name ?? "",
                 project?.path ?? "",
-            ].contains { $0.localizedCaseInsensitiveContains(normalizedQuery) }
+            ] + ThreadPullRequests.searchTerms(thread.pullRequests, legacy: thread.linkedPullRequest))
+                .contains { $0.localizedCaseInsensitiveContains(normalizedQuery) }
         }
+    }
+}
+
+/// Every thread field the sidebar index reads to pick a shelf or an order.
+/// `FeatureRootModel` bumps the Home presentation revision only when one of
+/// these changes, so a streaming turn (which touches `updatedAt`, `preview`,
+/// and `settlementFacts.latestTurn` several times a second) reconfigures its
+/// own row without re-sorting the whole list.
+struct HomeOrderKey: Equatable {
+    let projectID: String
+    let environmentID: String?
+    let wireID: String?
+    let isArchived: Bool
+    let state: FeatureThreadState
+    let createdAt: Date
+    let unsettledAt: Date?
+    let activeOrderKey: String?
+    let pinnedAt: Date?
+    let pinOrderKey: String?
+    let snoozedUntil: Date?
+    let snoozedAt: Date?
+    let attentionAt: Date?
+    let latestTurnCompletedAt: Date?
+    let supportsSettlement: Bool?
+    let settlementOverride: FeatureThreadSettlementOverride?
+    let latestUserMessageAt: Date?
+    let sessionStatus: String?
+    let latestTurn: FeatureThreadSettlementFacts.LatestTurn?
+    let keepsActive: Bool
+    let isSettled: Bool
+    let title: String
+    let pullRequestSearchTerms: [String]
+    /// Only the archived shelf orders by `updatedAt`; live shelves ignore it.
+    let archivedSortDate: Date?
+    /// Only a settled thread's position depends on its settled sort date.
+    let settledSortDate: Date?
+
+    init(_ thread: FeatureThread) {
+        projectID = thread.projectID
+        environmentID = thread.environmentID
+        wireID = thread.wireID
+        isArchived = thread.isArchived
+        state = thread.state
+        createdAt = thread.createdAt
+        unsettledAt = thread.unsettledAt
+        activeOrderKey = thread.activeOrderKey
+        pinnedAt = thread.pinnedAt
+        pinOrderKey = thread.pinOrderKey
+        snoozedUntil = thread.snoozedUntil
+        snoozedAt = thread.snoozedAt
+        attentionAt = thread.attentionAt
+        latestTurnCompletedAt = thread.latestTurnCompletedAt
+        supportsSettlement = thread.supportsSettlement
+        settlementOverride = thread.settlementFacts?.settlementOverride
+        latestUserMessageAt = thread.settlementFacts?.latestUserMessageAt
+        sessionStatus = thread.settlementFacts?.sessionStatus
+        latestTurn = thread.settlementFacts?.latestTurn
+        keepsActive = thread.keepsActive
+        isSettled = thread.isSettled
+        title = thread.title
+        pullRequestSearchTerms = ThreadPullRequests.searchTerms(thread.pullRequests, legacy: thread.linkedPullRequest)
+        archivedSortDate = thread.isArchived ? thread.updatedAt : nil
+        settledSortDate = thread.isEffectivelySettled() ? thread.settledSortDate : nil
     }
 }
 
@@ -821,9 +919,7 @@ struct DailyUXSidebarIndex {
 enum DailyUXSidebarRefresh {
     static func nextBoundary(
         for threads: [FeatureThread],
-        after now: Date,
-        settings _: FeatureSettings = .init(),
-        pullRequestsByThreadID _: [String: HomeThreadPullRequestPresentation] = [:]
+        after now: Date
     ) -> Date? {
         threads.reduce(nil as Date?) { earliest, thread in
             let snoozeBoundary = thread.isEffectivelySnoozed(at: now)

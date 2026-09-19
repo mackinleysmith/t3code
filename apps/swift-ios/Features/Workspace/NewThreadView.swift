@@ -18,6 +18,7 @@ public struct NewThreadView: View {
     @State private var selectionIsExplicit = false
     @State private var preferredSelection: FeatureSelection?
     @State private var attachments: [FeatureDraftAttachment] = []
+    @State private var composerContext: OrchestrationMessageContext?
     @State private var workspaceMode: FeatureWorkspaceMode = .local
     @State private var workspaceSelectionIsExplicit = false
     @State private var branches: [FeatureWorkspaceBranch] = []
@@ -29,12 +30,12 @@ public struct NewThreadView: View {
     @State private var branchSelectionError: String?
     @State private var activePicker: NewTaskPicker?
     @State private var isSubmitting = false
-    @State private var submissionFailed = false
     @State private var submissionValidationError: String?
     @State private var restoredDraftProjectID: String?
     @State private var draftRestoreContext: NewTaskDraftRestoreContext?
     @State private var draftSaveTask: Task<Void, Never>?
     @State private var draftSaveError: String?
+    @State private var missingFileRecoverySnapshot: FeatureComposerDraft?
     @State private var immediateDraftSaveTasks: [String: Task<Void, Never>] = [:]
     @State private var submittedSuccessfully = false
     @State private var restoresPromptAfterPickerDismissal = false
@@ -121,7 +122,15 @@ public struct NewThreadView: View {
                         onDismissKeyboard: { promptFocused = false },
                         onRefreshModels: refreshSelectedEnvironmentModels,
                         draftSaveError: draftSaveError,
-                        onRetryDraftSave: persistCurrentDraftImmediately
+                        onRetryDraftSave: missingFileRecoverySnapshot == nil ? {
+                            if restoredDraftProjectID == projectID {
+                                persistCurrentDraftImmediately()
+                            } else {
+                                Task { await restoreDraftAndLoadBranches() }
+                            }
+                        } : nil,
+                        context: contextBinding,
+                        contextAttachmentResolver: model.client as? any FeatureContextAttachmentResolving
                     )
                 }
                 .background(T3Colors.background)
@@ -141,6 +150,19 @@ public struct NewThreadView: View {
             }
         }
         .onChange(of: projectID) { prepareProjectIfNeeded(projectID) }
+        .onChange(of: initialSelection) { _, value in
+            if !selectionIsExplicit { selection = value }
+        }
+        .onChange(of: environmentPreferences) { previous, preferences in
+            guard !workspaceSelectionIsExplicit,
+                  previous.defaultWorkspaceMode != preferences.defaultWorkspaceMode
+                    || previous.newWorktreesStartFromOrigin != preferences.newWorktreesStartFromOrigin else { return }
+            workspaceMode = preferences.defaultWorkspaceMode
+            startFromOrigin = preferences.newWorktreesStartFromOrigin
+            selectedBranch = workspaceMode == .local
+                ? NewTaskWorkspaceDefaults.localBranch(in: branches)
+                : NewTaskWorkspaceDefaults.worktreeBase(in: branches)
+        }
         .onChange(of: creationProjectIDs) { _, ids in
             guard !ids.contains(projectID) else { return }
             if projectID.isEmpty {
@@ -202,6 +224,8 @@ public struct NewThreadView: View {
             }
         }) { picker in
             switch picker {
+            case .projectSettings:
+                ProjectPreferencesSheet(model: model, projectID: projectID)
             case .project:
                 NewTaskProjectPicker(
                     groups: creationProjectGroups,
@@ -232,13 +256,6 @@ public struct NewThreadView: View {
                 )
             }
         }
-        .alert("Couldn’t start task", isPresented: $submissionFailed) {
-            // Refocus on dismissal, not on failure: the alert takes first
-            // responder, so an earlier refocus never survives it.
-            Button("OK") { promptFocused = true }
-        } message: {
-            Text("Check your connection and try again.")
-        }
         .interactiveDismissDisabled(isSubmitting || isSwitchingBranch)
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
@@ -261,6 +278,18 @@ public struct NewThreadView: View {
                 .disabled(isSubmitting)
                 .accessibilityLabel("Cancel new task")
             Spacer()
+            if selectedProject != nil {
+                Button {
+                    presentPicker(.projectSettings)
+                } label: {
+                    Image(systemName: "gearshape")
+                        .frame(width: 44, height: 44)
+                }
+                .foregroundStyle(T3Colors.textSecondary)
+                .disabled(isSubmitting)
+                .accessibilityLabel("Project settings")
+                .accessibilityIdentifier("new-task-project-settings")
+            }
         }
         .padding(.horizontal, 16)
         .frame(height: 48)
@@ -535,6 +564,7 @@ public struct NewThreadView: View {
                 if workspaceMode == .worktree {
                     Button {
                         workspaceSelectionIsExplicit = true
+                        missingFileRecoverySnapshot = nil
                         startFromOrigin.toggle()
                     } label: {
                         Label(
@@ -629,6 +659,7 @@ public struct NewThreadView: View {
         case .disconnected: return "Offline"
         case .connecting: return "Connecting"
         case .reconnecting: return "Reconnecting"
+        case .needsPairing: return "Pair again"
         case .connected, .none: return nil
         }
     }
@@ -665,6 +696,7 @@ public struct NewThreadView: View {
                     && value == initialSelection
                 selection = value
                 guard !materializesProjectDefault else { return }
+                missingFileRecoverySnapshot = nil
                 selectionIsExplicit = true
                 preferredSelection = value
             }
@@ -817,7 +849,8 @@ public struct NewThreadView: View {
                 draftKey: draftKey ?? FeatureComposerDraftStore.newTaskKey(project: project),
                 environmentID: project.environmentID,
                 attachments: attachments
-            )
+            ),
+            context: composerContext
         )
 
         Task { @MainActor in
@@ -840,7 +873,9 @@ public struct NewThreadView: View {
             } else {
                 isSubmitting = false
                 persistCurrentDraftImmediately()
-                submissionFailed = true
+                submissionValidationError = model.lastTaskStartError
+                    ?? "Could not start the task. Check the connection and try again."
+                promptFocused = true
             }
         }
     }
@@ -927,10 +962,12 @@ public struct NewThreadView: View {
 
         restoredDraftProjectID = nil
         draftSaveError = nil
+        missingFileRecoverySnapshot = nil
         draftSaveTask?.cancel()
         draftSaveTask = nil
         prompt = carryingContent?.text ?? ""
         attachments = carryingContent?.attachments ?? []
+        composerContext = carryingContent?.context
         selectionIsExplicit = false
         workspaceSelectionIsExplicit = false
         branches = []
@@ -973,6 +1010,7 @@ public struct NewThreadView: View {
     }
 
     private func setWorkspaceMode(_ mode: FeatureWorkspaceMode) {
+        missingFileRecoverySnapshot = nil
         workspaceSelectionIsExplicit = true
         workspaceMode = mode
         selectedBranch = switch mode {
@@ -994,6 +1032,7 @@ public struct NewThreadView: View {
                 projectID: requestedProjectID, branch: branch, mode: requestedMode
             )
             guard projectID == requestedProjectID, workspaceMode == requestedMode else { return }
+            missingFileRecoverySnapshot = nil
             workspaceSelectionIsExplicit = true
             selectedBranch = selected
             // A checkout can change a remote ref into a local one.
@@ -1074,19 +1113,28 @@ public struct NewThreadView: View {
         let liveDraft = composerDraft
         let liveSelectionIsExplicit = selectionIsExplicit
         let liveWorkspaceSelectionIsExplicit = workspaceSelectionIsExplicit
-        let restored = context.merging(
-            saved: saved,
-            current: liveDraft,
-            fallbackSelection: initialSelection,
-            fallbackWorkspace: FeatureComposerWorkspaceDraft(
-                mode: environmentPreferences.defaultWorkspaceMode,
-                branch: nil,
-                worktreePath: nil,
-                startFromOrigin: environmentPreferences.newWorktreesStartFromOrigin
+        let restored: FeatureComposerDraft
+        var recoveredMissingFiles = false
+        do {
+            restored = try context.merging(
+                saved: saved,
+                current: liveDraft,
+                fallbackSelection: initialSelection,
+                fallbackWorkspace: FeatureComposerWorkspaceDraft(
+                    mode: environmentPreferences.defaultWorkspaceMode,
+                    branch: nil,
+                    worktreePath: nil,
+                    startFromOrigin: environmentPreferences.newWorktreesStartFromOrigin
+                ),
+                onMissingAttachments: { recoveredMissingFiles = true }
             )
-        )
+        } catch {
+            draftSaveError = error.localizedDescription
+            return
+        }
         prompt = restored.text
         attachments = restored.attachments
+        composerContext = restored.context
         selection = DailyUXModelOptions.validated(restored.selection, in: creationProviders)
             ?? initialSelection
         selectionIsExplicit = liveSelectionIsExplicit || saved?.selection != nil
@@ -1106,6 +1154,10 @@ public struct NewThreadView: View {
         workspaceSelectionIsExplicit = liveWorkspaceSelectionIsExplicit
             || saved?.workspace != nil
         restoredDraftProjectID = requestedProjectID
+        missingFileRecoverySnapshot = context.recoverySnapshot(
+            restored: composerDraft, saved: saved, hasMissingFiles: recoveredMissingFiles
+        )
+        draftSaveError = recoveredMissingFiles ? FeatureComposerDraftRestoration.missingFilesWarning : nil
         if context.shouldCarryContent(into: saved) {
             persistCurrentDraftImmediately()
         } else if liveDraft != context.baseline {
@@ -1125,6 +1177,13 @@ public struct NewThreadView: View {
     private var currentDraftKey: String? {
         guard let project = selectedProject else { return nil }
         return draftKey(for: project)
+    }
+
+    private var contextBinding: Binding<OrchestrationMessageContext?> {
+        Binding(get: { composerContext }, set: { value in
+            composerContext = value
+            scheduleDraftSave()
+        })
     }
 
     private var attachmentBinding: Binding<[FeatureDraftAttachment]> {
@@ -1160,7 +1219,8 @@ public struct NewThreadView: View {
                         : nil,
                     startFromOrigin: startFromOrigin
                 )
-                : nil
+                : nil,
+            context: composerContext
         )
     }
 
@@ -1171,6 +1231,8 @@ public struct NewThreadView: View {
               let key = currentDraftKey else {
             return
         }
+        guard !FeatureComposerDraftRestoration.keepsSavedRecovery(missingFileRecoverySnapshot, current: composerDraft) else { return }
+        missingFileRecoverySnapshot = nil
         let pendingDraftSaveTask = draftSaveTask
         pendingDraftSaveTask?.cancel()
         draftSaveTask = nil
@@ -1207,6 +1269,8 @@ public struct NewThreadView: View {
               let key = currentDraftKey else {
             return
         }
+        guard !FeatureComposerDraftRestoration.keepsSavedRecovery(missingFileRecoverySnapshot, current: composerDraft) else { return }
+        missingFileRecoverySnapshot = nil
         let pendingDraftSaveTask = draftSaveTask
         pendingDraftSaveTask?.cancel()
         draftSaveTask = nil
@@ -1226,8 +1290,14 @@ public struct NewThreadView: View {
                restoreContext.projectID == draftProjectID {
                 let saved = try? await draftStore.draft(for: key)
                 guard !Task.isCancelled else { return }
-                let merged = restoreContext.merging(saved: saved, current: snapshot)
                 do {
+                    var hasMissingAttachments = false
+                    let merged = try restoreContext.merging(saved: saved, current: snapshot,
+                        onMissingAttachments: { hasMissingAttachments = true })
+                    guard !hasMissingAttachments else {
+                        if currentDraftKey == key { draftSaveError = FeatureComposerDraftRestoration.missingFilesWarning }
+                        return
+                    }
                     try await draftStore.setDraft(merged, for: key)
                     guard !Task.isCancelled else { return }
                     if currentDraftKey == key { draftSaveError = nil }
@@ -1317,7 +1387,8 @@ struct NewTaskDraftRestoreContext: Equatable {
                     attachment.uploadedReference = nil
                 }
                 return attachment
-            }
+            },
+            context: draft.context
         )
     }
 
@@ -1331,24 +1402,34 @@ struct NewTaskDraftRestoreContext: Equatable {
         )
     }
 
+    /// A carry writes to the new target, not the source draft that still owns the recovery copy.
+    func recoverySnapshot(
+        restored: FeatureComposerDraft, saved: FeatureComposerDraft?, hasMissingFiles: Bool
+    ) -> FeatureComposerDraft? {
+        hasMissingFiles && !shouldCarryContent(into: saved) ? restored : nil
+    }
+
     func merging(
         saved: FeatureComposerDraft?,
         current: FeatureComposerDraft,
         fallbackSelection: FeatureSelection? = nil,
-        fallbackWorkspace: FeatureComposerWorkspaceDraft? = nil
-    ) -> FeatureComposerDraft {
+        fallbackWorkspace: FeatureComposerWorkspaceDraft? = nil,
+        onMissingAttachments: () -> Void = {}
+    ) throws -> FeatureComposerDraft {
         var target = saved
         if shouldCarryContent(into: saved) {
             target = saved ?? FeatureComposerDraft()
             target?.text = baseline.text
             target?.attachments = baseline.attachments
+            target?.context = baseline.context
         }
-        var restored = FeatureComposerDraftRestoration.merge(
+        var restored = try FeatureComposerDraftRestoration.merge(
             saved: target,
             baseline: baseline,
             current: current,
             fallbackSelection: fallbackSelection,
-            fallbackWorkspace: fallbackWorkspace
+            fallbackWorkspace: fallbackWorkspace,
+            onMissingAttachments: onMissingAttachments
         )
         if let environmentID {
             restored.attachments = Self.content(
@@ -1370,6 +1451,7 @@ private struct DottedUnderline: Shape {
 }
 
 private enum NewTaskPicker: String, Identifiable {
+    case projectSettings
     case project
     case branch
 

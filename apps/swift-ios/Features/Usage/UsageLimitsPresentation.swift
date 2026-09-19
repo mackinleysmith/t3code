@@ -149,7 +149,7 @@ enum UsageLimitsPresentation {
     }
 }
 
-enum UsageLimitPace: Equatable {
+enum UsageLimitPace: Equatable, Sendable {
     case ahead
     case on
     case under
@@ -218,9 +218,7 @@ enum UsageLimitsMath {
     }
 
     private static func date(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        UsageFormat.isoDate(value)
     }
 }
 

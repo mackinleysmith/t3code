@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import OSLog
 
 public protocol WebSocketConnection: Sendable {
@@ -153,6 +154,12 @@ private struct RPCResponseEnvelope: Decodable, Sendable {
 public actor WebSocketRPCClient {
     public typealias EndpointProvider = @Sendable () async throws -> URL
 
+    public enum ResponseDeadline: Sendable, Equatable {
+        case standard
+        /// Setup can run until it completes, disconnects, or its caller cancels.
+        case none
+    }
+
     private static let logger = Logger(
         subsystem: "com.t3tools.t3code",
         category: "WebSocketRPC"
@@ -160,6 +167,7 @@ public actor WebSocketRPCClient {
 
     private struct UnaryRequest {
         let envelope: RPCRequestEnvelope
+        let responseDeadline: ResponseDeadline
         var sent: Bool
         var connectionWaitTask: Task<Void, Never>?
         var sendDeadlineTask: Task<Void, Never>?
@@ -247,9 +255,9 @@ public actor WebSocketRPCClient {
             return await value.sendKeepalive(expectedConnectionID: connectionID)
         }
 
-        func reconnectDelay(failureCount: Int, loopID: UUID) async -> Duration? {
+        func beginReconnectDelay(failureCount: Int, loopID: UUID) async -> Task<Bool, Never>? {
             guard let value else { return nil }
-            return await value.reconnectDelay(failureCount: failureCount, loopID: loopID)
+            return await value.beginReconnectDelay(failureCount: failureCount, loopID: loopID)
         }
     }
 
@@ -257,6 +265,7 @@ public actor WebSocketRPCClient {
     private let endpointProvider: EndpointProvider
     private let connectionWaitTimeout: Duration
     private let responseTimeout: Duration
+    private let responseDeadlineSleep: @Sendable (Duration) async throws -> Void
     private let keepaliveInterval: Duration
     private let subscriptionBufferLimit: Int
     private let reconnectBackoff: @Sendable (Int) -> Duration
@@ -264,7 +273,12 @@ public actor WebSocketRPCClient {
     private var connectionID: UUID?
     private var loopTask: Task<Void, Never>?
     private var loopID: UUID?
+    /// The reconnect backoff currently sleeping, so a network path recovery
+    /// can cut it short. Cancelled only while the client is still desired.
+    private var backoffSleepTask: Task<Bool, Never>?
     private var keepaliveTask: Task<Void, Never>?
+    private var pathMonitor: NWPathMonitor?
+    private var pathIsSatisfied: Bool?
     private var desired = false
     private var nextRequestID = 1
     private var unary: [Int: UnaryRequest] = [:]
@@ -277,12 +291,17 @@ public actor WebSocketRPCClient {
         connector: any WebSocketConnecting = URLSessionWebSocketConnector(),
         connectionWaitTimeout: Duration = .seconds(4),
         responseTimeout: Duration = .seconds(30),
+        responseDeadlineSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        },
         keepaliveInterval: Duration = .seconds(5),
-        subscriptionBufferLimit: Int = 128,
+        subscriptionBufferLimit: Int = 1_024,
         reconnectBackoff: @escaping @Sendable (Int) -> Duration = { failureCount in
+            // Fast first retries, then a 30s cap. Every attempt mints an HTTP
+            // ticket, so a long outage must not hammer the ticket endpoint.
             // Jitter desynchronizes reconnects across environments so a
             // server restart doesn't trigger simultaneous ticket mints.
-            let backoff = min(5.0, 0.35 * pow(1.7, Double(failureCount - 1)))
+            let backoff = min(30.0, 0.35 * pow(1.7, Double(failureCount - 1)))
             return .seconds(backoff * Double.random(in: 0.5...1.0))
         },
         endpointProvider: @escaping EndpointProvider
@@ -290,6 +309,7 @@ public actor WebSocketRPCClient {
         self.connector = connector
         self.connectionWaitTimeout = connectionWaitTimeout
         self.responseTimeout = responseTimeout
+        self.responseDeadlineSleep = responseDeadlineSleep
         self.keepaliveInterval = keepaliveInterval > .zero ? keepaliveInterval : .seconds(5)
         self.subscriptionBufferLimit = max(1, subscriptionBufferLimit)
         self.reconnectBackoff = reconnectBackoff
@@ -298,11 +318,14 @@ public actor WebSocketRPCClient {
 
     deinit {
         loopTask?.cancel()
+        backoffSleepTask?.cancel()
         keepaliveTask?.cancel()
+        pathMonitor?.cancel()
     }
 
     public func start() {
         desired = true
+        startPathMonitor()
         guard loopTask == nil else { return }
         let id = UUID()
         loopID = id
@@ -360,6 +383,11 @@ public actor WebSocketRPCClient {
         loopID = nil
         loopTask?.cancel()
         loopTask = nil
+        backoffSleepTask?.cancel()
+        backoffSleepTask = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        pathIsSatisfied = nil
         keepaliveTask?.cancel()
         keepaliveTask = nil
         awaitingKeepaliveResponse = false
@@ -381,9 +409,10 @@ public actor WebSocketRPCClient {
     public func request<Result: Decodable & Sendable>(
         _ tag: String,
         payload: JSONValue = .object([:]),
+        responseDeadline: ResponseDeadline = .standard,
         as type: Result.Type
     ) async throws -> Result {
-        let raw = try await requestRaw(tag, payload: payload)
+        let raw = try await requestRaw(tag, payload: payload, responseDeadline: responseDeadline)
         return try raw.decode(type)
     }
 
@@ -391,7 +420,7 @@ public actor WebSocketRPCClient {
         _ tag: String,
         payload: JSONValue = .object([:])
     ) async throws {
-        _ = try await requestRaw(tag, payload: payload)
+        _ = try await requestRaw(tag, payload: payload, responseDeadline: .standard)
     }
 
     public func subscribe<Value: Decodable & Sendable>(
@@ -406,7 +435,9 @@ public actor WebSocketRPCClient {
     }
 
     /// Preserve server batches for consumers that can apply several events at once.
-    /// Bound both batch size and queued batches to the existing event budget.
+    /// The queue fits normal catch-up chunks. An overflow requests a resync
+    /// without acknowledging lost values. Enqueueing is not consumer progress,
+    /// so server acknowledgements alone cannot bound this queue.
     public func subscribeBatches<Value: Decodable & Sendable>(
         _ tag: String,
         payload: JSONValue = .object([:]),
@@ -460,8 +491,8 @@ public actor WebSocketRPCClient {
                     }
                 }
             )
-            continuation.onTermination = { @Sendable _ in
-                Task { await self.removeSubscription(subscriptionID) }
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { await self?.removeSubscription(subscriptionID) }
             }
             if connection != nil {
                 Task { await self.sendSubscription(subscriptionID) }
@@ -477,21 +508,38 @@ public actor WebSocketRPCClient {
         payload: JSONValue = .object([:]),
         as type: Value.Type
     ) async throws -> (events: AsyncThrowingStream<Value, Error>, connectionID: UUID) {
+        try await subscribeOnCurrentConnection {
+            subscribe(tag, payload: payload, reconnect: false, as: type)
+        }
+    }
+
+    public func subscribeBatchesOnCurrentConnection<Value: Decodable & Sendable>(
+        _ tag: String,
+        payload: JSONValue = .object([:]),
+        as type: Value.Type
+    ) async throws -> (events: AsyncThrowingStream<[Value], Error>, connectionID: UUID) {
+        try await subscribeOnCurrentConnection {
+            subscribeBatches(tag, payload: payload, reconnect: false, as: type)
+        }
+    }
+
+    private func subscribeOnCurrentConnection<Value: Sendable>(
+        makeStream: () -> AsyncThrowingStream<Value, Error>
+    ) async throws -> (events: AsyncThrowingStream<Value, Error>, connectionID: UUID) {
         try Task.checkCancellation()
         start()
         while true {
             try Task.checkCancellation()
             if let id = connectionID {
-                return (
-                    subscribe(tag, payload: payload, reconnect: false, as: type),
-                    id
-                )
+                return (makeStream(), id)
             }
             _ = try await waitForConnection(after: nil)
         }
     }
 
-    private func requestRaw(_ tag: String, payload: JSONValue) async throws -> JSONValue {
+    private func requestRaw(
+        _ tag: String, payload: JSONValue, responseDeadline: ResponseDeadline
+    ) async throws -> JSONValue {
         start()
         let id = allocateRequestID()
         let envelope = RPCRequestEnvelope(
@@ -510,6 +558,7 @@ public actor WebSocketRPCClient {
                 }
                 unary[id] = UnaryRequest(
                     envelope: envelope,
+                    responseDeadline: responseDeadline,
                     sent: false,
                     connectionWaitTask: nil,
                     sendDeadlineTask: nil,
@@ -590,11 +639,22 @@ public actor WebSocketRPCClient {
                 }
                 guard await owner.isCurrentConnectionLoop(loopID), !Task.isCancelled else { break }
                 retry += 1
-                guard let delay = await owner.reconnectDelay(
+                guard let sleep = await owner.beginReconnectDelay(
                     failureCount: retry,
                     loopID: loopID
                 ) else { break }
-                try? await Task.sleep(for: delay)
+                // The sleep is a detached task so this wait does not retain
+                // the client. Cancelling this loop must still end it at once.
+                let interrupted = await withTaskCancellationHandler {
+                    await sleep.value
+                } onCancel: {
+                    sleep.cancel()
+                }
+                // A network path recovery cancels the sleep while this loop is
+                // still current. Retry immediately with fresh backoff.
+                if interrupted, await owner.isCurrentConnectionLoop(loopID) {
+                    retry = 0
+                }
             }
         }
         await owner.finishConnectionLoop(loopID)
@@ -605,9 +665,43 @@ public actor WebSocketRPCClient {
         return ConnectionAttempt(connector: connector, endpointProvider: endpointProvider)
     }
 
-    private func reconnectDelay(failureCount: Int, loopID: UUID) -> Duration? {
+    /// Returns a sleeping task that resolves to `true` when it was cancelled
+    /// before the delay elapsed.
+    private func beginReconnectDelay(failureCount: Int, loopID: UUID) -> Task<Bool, Never>? {
         guard isCurrentConnectionLoop(loopID) else { return nil }
-        return reconnectBackoff(failureCount)
+        let delay = reconnectBackoff(failureCount)
+        let sleep = Task.detached {
+            do {
+                try await Task.sleep(for: delay)
+                return false
+            } catch {
+                return true
+            }
+        }
+        backoffSleepTask = sleep
+        return sleep
+    }
+
+    private func startPathMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { @Sendable [weak self] path in
+            let isSatisfied = path.status == .satisfied
+            Task { await self?.pathStatusChanged(isSatisfied: isSatisfied) }
+        }
+        monitor.start(queue: .global(qos: .utility))
+        pathMonitor = monitor
+    }
+
+    /// Wakes a sleeping backoff when the network comes back. The first report
+    /// and later drops change nothing: only an unsatisfied-to-satisfied edge
+    /// while no socket is live is worth an immediate attempt.
+    private func pathStatusChanged(isSatisfied: Bool) {
+        let wasSatisfied = pathIsSatisfied
+        pathIsSatisfied = isSatisfied
+        guard isSatisfied, wasSatisfied == false, desired, connection == nil else { return }
+        backoffSleepTask?.cancel()
+        backoffSleepTask = nil
     }
 
     private func installConnection(
@@ -895,10 +989,15 @@ public actor WebSocketRPCClient {
         request.connectionWaitTask = nil
         request.sendDeadlineTask?.cancel()
         request.sendDeadlineTask = nil
+        guard request.responseDeadline == .standard else {
+            unary[id] = request
+            return
+        }
         let responseTimeout = responseTimeout
+        let sleep = responseDeadlineSleep
         request.responseDeadlineTask = Task { [weak self] in
             do {
-                try await Task.sleep(for: responseTimeout)
+                try await sleep(responseTimeout)
             } catch {
                 return
             }
@@ -926,7 +1025,7 @@ public actor WebSocketRPCClient {
     private func failUnaryOnSendDeadline(_ id: Int, connectionID: UUID) async {
         guard let request = unary[id],
               request.sent,
-              request.responseDeadlineTask == nil else { return }
+              request.sendDeadlineTask != nil else { return }
         completeUnary(id, with: .failure(RPCError.responseTimedOut))
         await disconnected(expectedConnectionID: connectionID)
     }
