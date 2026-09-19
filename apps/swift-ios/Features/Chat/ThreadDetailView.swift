@@ -3006,45 +3006,58 @@ struct FeatureMessageView: View {
         case .user:
             HStack {
                 Spacer(minLength: 44)
-                VStack(alignment: .leading, spacing: 10) {
-                    FeatureMessageAttachmentsView(attachments: message.attachments, context: attachmentContext)
-                    if !message.text.isEmpty {
-                        MarkdownMessageView(
-                            renderedText,
-                            isStreaming: message.state == .streaming,
-                            imageContext: imageContext,
-                            skills: skills,
-                            clipboardSource: clipboardSource,
-                            messageContext: message.context,
-                            copyText: message.text
-                        )
+                VStack(alignment: .trailing, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        FeatureMessageAttachmentsView(attachments: message.attachments, context: attachmentContext)
+                        if !message.text.isEmpty {
+                            MarkdownMessageView(
+                                renderedText,
+                                isStreaming: message.state == .streaming,
+                                imageContext: imageContext,
+                                skills: skills,
+                                clipboardSource: clipboardSource,
+                                messageContext: message.context,
+                                copyText: message.text
+                            )
+                        }
+                        if message.state == .queued {
+                            Label("Queued. Sends when connected.", systemImage: "clock")
+                                .font(T3Typography.supporting)
+                                .foregroundStyle(T3Colors.textTertiary)
+                        } else if message.state == .failed {
+                            Label("Not sent", systemImage: "exclamationmark.circle")
+                                .font(T3Typography.supporting)
+                                .foregroundStyle(T3Colors.danger)
+                        }
                     }
-                    if message.state == .queued {
-                        Label("Queued. Sends when connected.", systemImage: "clock")
-                            .font(T3Typography.supporting)
-                            .foregroundStyle(T3Colors.textTertiary)
-                    } else if message.state == .failed {
-                        Label("Not sent", systemImage: "exclamationmark.circle")
-                            .font(T3Typography.supporting)
-                            .foregroundStyle(T3Colors.danger)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 11)
+                    .frame(maxWidth: T3Metrics.readingWidth * 0.88, alignment: .leading)
+                    .background(
+                        T3Colors.subtleStrong,
+                        in: UnevenRoundedRectangle(
+                            topLeadingRadius: 16,
+                            bottomLeadingRadius: 16,
+                            bottomTrailingRadius: 4,
+                            topTrailingRadius: 16
+                        )
+                    )
+                    .accessibilityLabel("You")
+                    .accessibilityValue(accessibilityValue)
+                    .accessibilityIdentifier("message-\(message.id)")
+                    if !message.text.isEmpty, message.state == .complete {
+                        HStack(spacing: 4) {
+                            Text(message.updatedAt ?? message.createdAt, format: .dateTime.hour().minute())
+                                .monospacedDigit()
+                                .font(T3Typography.supporting)
+                                .foregroundStyle(T3Colors.textTertiary)
+                            FeatureMessageCopyButton(text: message.text, isUserMessage: true)
+                                .id(message.id)
+                                .accessibilityIdentifier("copy-message-\(message.id)")
+                        }
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-                .frame(maxWidth: T3Metrics.readingWidth * 0.88, alignment: .leading)
-                .background(
-                    T3Colors.subtleStrong,
-                    in: UnevenRoundedRectangle(
-                        topLeadingRadius: 16,
-                        bottomLeadingRadius: 16,
-                        bottomTrailingRadius: 4,
-                        topTrailingRadius: 16
-                    )
-                )
             }
-            .accessibilityLabel("You")
-            .accessibilityValue(accessibilityValue)
-            .accessibilityIdentifier("message-\(message.id)")
         case .assistant:
             VStack(alignment: .leading, spacing: 10) {
                 FeatureMessageAttachmentsView(attachments: message.attachments, context: attachmentContext)
@@ -3061,7 +3074,7 @@ struct FeatureMessageView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if message.state != .streaming {
                         HStack(spacing: 4) {
-                            FeatureResponseCopyButton(text: message.text)
+                            FeatureMessageCopyButton(text: message.text)
                                 .id(message.id)
                                 .accessibilityIdentifier("copy-response-\(message.id)")
                             Text(message.updatedAt ?? message.createdAt, format: .dateTime.hour().minute())
@@ -3125,15 +3138,16 @@ struct FeatureMessageView: View {
     }
 }
 
-private struct FeatureResponseCopyButton: View {
+private struct FeatureMessageCopyButton: View {
     let text: String
+    var isUserMessage = false
     @State private var copied = false
 
     var body: some View {
         Button {
             UIPasteboard.general.string = text
             copied = true
-            UIAccessibility.post(notification: .announcement, argument: "Response copied")
+            UIAccessibility.post(notification: .announcement, argument: isUserMessage ? "Message copied" : "Response copied")
         } label: {
             Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
                 .labelStyle(.iconOnly)
@@ -3143,8 +3157,8 @@ private struct FeatureResponseCopyButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Copy response")
-        .accessibilityHint("Copies the full response as Markdown")
+        .accessibilityLabel(isUserMessage ? "Copy message" : "Copy response")
+        .accessibilityHint(isUserMessage ? "Copies the full message text" : "Copies the full response as Markdown")
         .sensoryFeedback(.success, trigger: copied) { _, isCopied in isCopied }
         .task(id: copied) {
             guard copied else { return }
