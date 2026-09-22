@@ -90,11 +90,14 @@ export function ProviderUpdatePrimaryNotification() {
     useDismissedProviderUpdateNotificationKeys();
 
   // If the user adds a secondary environment and the root switches to the
-  // per-environment popover, close any prompt this flow owns.
+  // per-environment popover, close any prompt this flow owns. Nobody answered
+  // it, so forget it was shown: when the secondary is removed again, this flow
+  // remounts and must be able to offer the same update once more.
   useEffect(() => {
     return () => {
       const activeToast = activeToastRef.current;
       if (activeToast?.kind === "prompt") {
+        seenProviderUpdateNotificationKeys.delete(activeToast.key);
         toastManager.close(activeToast.toastId);
       }
       activeToastRef.current = null;
