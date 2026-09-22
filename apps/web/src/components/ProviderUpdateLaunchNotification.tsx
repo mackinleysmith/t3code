@@ -1,5 +1,4 @@
 import { useNavigate } from "@tanstack/react-router";
-import { DownloadIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useEnvironments } from "~/state/environments";
@@ -13,7 +12,8 @@ import {
   getProviderUpdateInitialToastView,
 } from "./ProviderUpdateLaunchNotification.logic";
 import { ProviderUpdatePrimaryNotification } from "./ProviderUpdatePrimaryNotification";
-import { stackedThreadToast, toastManager } from "./ui/toast";
+import { ProviderUpdateToastIcon } from "./ProviderUpdateToastIcon";
+import { stackedThreadToast, toastManager, type ThreadToastData } from "./ui/toast";
 
 /**
  * True when the catalog holds any environment besides the primary. This reads
@@ -67,7 +67,11 @@ function ProviderUpdateEnvironmentsNotification() {
     /** Every update this prompt has offered, so an unanswered close can un-see them. */
     readonly shownKeys: Set<string>;
     title: string;
+    /** The toast's `data`, kept so a title refresh can re-send it with a new icon. */
+    data: ThreadToastData;
   } | null>(null);
+  // Filled by the rows body; the toast's "Update all" action calls through it.
+  const updateAllRef = useRef<(() => void) | null>(null);
   const notificationKeysRef = useRef<ReadonlyArray<string>>([]);
   // Whether the user has triggered an update from the current toast. Afterward
   // the prompt is kept even when no updates remain, so its result rows survive.
@@ -99,16 +103,19 @@ function ProviderUpdateEnvironmentsNotification() {
     notificationKeysRef.current = notificationKeys;
   }, [notificationKeys]);
 
-  // Title summarizes the distinct providers on offer across all environments;
-  // the per-environment detail lives in the popover body.
-  const title = useMemo(() => {
+  // Title and icon summarize the distinct providers on offer across all
+  // environments; the per-environment detail lives in the popover body.
+  const { title, soleDriver } = useMemo(() => {
     const candidateUnion = collectProviderUpdateCandidates(
       updateGroups.flatMap((group) => group.candidates),
     );
-    return getProviderUpdateInitialToastView({
-      updateProviders: candidateUnion,
-      oneClickProviders: candidateUnion,
-    }).title;
+    return {
+      title: getProviderUpdateInitialToastView({
+        updateProviders: candidateUnion,
+        oneClickProviders: candidateUnion,
+      }).title,
+      soleDriver: candidateUnion.length === 1 ? candidateUnion[0]!.driver : null,
+    };
   }, [updateGroups]);
 
   // Defer while a desktop-local backend is still connecting, up to the grace period.
@@ -150,8 +157,12 @@ function ProviderUpdateEnvironmentsNotification() {
         seenProviderUpdateNotificationKeys.add(key);
       }
       if (active.title !== title) {
-        toastManager.update(active.toastId, { title });
         active.title = title;
+        active.data = {
+          ...active.data,
+          leadingIcon: <ProviderUpdateToastIcon provider={soleDriver} />,
+        };
+        toastManager.update(active.toastId, { title, data: active.data });
       }
       return;
     }
@@ -175,6 +186,13 @@ function ProviderUpdateEnvironmentsNotification() {
       activeToastRef.current = null;
     };
 
+    const data: ThreadToastData = {
+      hideCopyButton: true,
+      leadingIcon: <ProviderUpdateToastIcon provider={soleDriver} />,
+      onClose: dismissPrompt,
+      secondaryActionProps: { children: "Settings", onClick: openProviderSettings },
+      secondaryActionVariant: "ghost",
+    };
     const toastId = toastManager.add(
       stackedThreadToast({
         type: "warning",
@@ -184,25 +202,22 @@ function ProviderUpdateEnvironmentsNotification() {
             onInteract={() => {
               hasInteractedRef.current = true;
             }}
+            updateAllRef={updateAllRef}
           />
         ),
         timeout: 0,
         actionProps: {
-          children: "Settings",
-          onClick: openProviderSettings,
+          children: "Update all",
+          onClick: () => updateAllRef.current?.(),
         },
-        actionVariant: "outline",
-        data: {
-          hideCopyButton: true,
-          leadingIcon: <DownloadIcon aria-hidden="true" className="size-4 text-success" />,
-          onClose: dismissPrompt,
-        },
+        data,
       }),
     );
-    activeToastRef.current = { toastId, shownKeys: new Set(notificationKeys), title };
+    activeToastRef.current = { toastId, shownKeys: new Set(notificationKeys), title, data };
   }, [
     notificationKeys,
     title,
+    soleDriver,
     isGated,
     closeUnansweredPrompt,
     dismissedNotificationKeys,

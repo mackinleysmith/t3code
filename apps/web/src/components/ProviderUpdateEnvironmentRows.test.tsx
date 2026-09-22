@@ -37,6 +37,10 @@ const hooks = vi.hoisted(() => {
       nextIndex();
       return callback;
     },
+    // Effects run synchronously on every render; nothing here needs cleanup.
+    useEffect(effect: () => void | (() => void)) {
+      effect();
+    },
     useMemo<T>(factory: () => T): T {
       nextIndex();
       return factory();
@@ -76,6 +80,7 @@ vi.mock("react", async (importOriginal) => {
   return {
     ...actual,
     useCallback: hooks.useCallback,
+    useEffect: hooks.useEffect,
     useMemo: hooks.useMemo,
     useRef: hooks.useRef,
     useState: hooks.useState,
@@ -157,9 +162,9 @@ type RowElement = ReactElement<{
   readonly onUpdate: () => void;
 }>;
 
-function renderRow(): RowElement {
+function renderRow(props: Parameters<typeof ProviderUpdateEnvironmentRows>[0] = {}): RowElement {
   hooks.beginRender();
-  const output = ProviderUpdateEnvironmentRows({}) as ReactElement<{
+  const output = ProviderUpdateEnvironmentRows(props) as ReactElement<{
     readonly children: RowElement | RowElement[];
   }>;
   const children = output.props.children;
@@ -222,5 +227,28 @@ describe("ProviderUpdateEnvironmentRows", () => {
     await flushPromises();
 
     expect(renderRow().props.status.kind).toBe("success");
+  });
+
+  it("updates every environment that still offers an update from one Update all", () => {
+    const candidate = provider() as ProviderUpdateCandidate;
+    const otherId = "env-mini" as EnvironmentId;
+    testState.groups = [
+      testState.groups[0]!,
+      { ...testState.groups[0]!, environmentId: otherId, label: "Mac Mini" },
+      // Already current: nothing to dispatch here.
+      { ...testState.groups[0]!, environmentId: "env-done" as EnvironmentId, candidates: [] },
+    ];
+    testState.updateProvider.mockReturnValue(new Promise(() => {}));
+    const updateAllRef = { current: null as (() => void) | null };
+
+    renderRow({ updateAllRef });
+    updateAllRef.current?.();
+
+    expect(testState.updateProvider).toHaveBeenCalledTimes(2);
+    expect(testState.updateProvider.mock.calls.map(([input]) => input.environmentId)).toEqual([
+      environmentId,
+      otherId,
+    ]);
+    expect(candidate).toBeDefined();
   });
 });

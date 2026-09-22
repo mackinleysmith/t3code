@@ -1,5 +1,13 @@
 import { CheckIcon } from "lucide-react";
-import { type ReactNode, useCallback, useMemo, useRef, useState } from "react";
+import {
+  type MutableRefObject,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { EnvironmentId, ServerProvider } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
@@ -157,9 +165,12 @@ function EnvironmentUpdateRow({
  */
 export function ProviderUpdateEnvironmentRows({
   onInteract,
+  updateAllRef,
 }: {
   /** Called the first time the user triggers an update, so the host can stop refreshing the prompt. */
   readonly onInteract?: () => void;
+  /** Filled with a function that updates every environment still offering one, for the host's "Update all" action. */
+  readonly updateAllRef?: MutableRefObject<(() => void) | null>;
 }) {
   const { groups } = useEnvironmentUpdateGroups();
   const updateProvider = useAtomCommand(serverEnvironment.updateProvider, {
@@ -357,6 +368,24 @@ export function ProviderUpdateEnvironmentRows({
     [clearPending, groupByEnvironment, onInteract, updateProvider],
   );
 
+  // "Update all" goes through the same per-environment path as the row
+  // buttons, so each environment keeps its own spinner, result, and guards.
+  useEffect(() => {
+    if (!updateAllRef) {
+      return;
+    }
+    updateAllRef.current = () => {
+      for (const group of groups) {
+        if (group.candidates.length > 0) {
+          void handleUpdate(group.environmentId);
+        }
+      }
+    };
+    return () => {
+      updateAllRef.current = null;
+    };
+  }, [groups, handleUpdate, updateAllRef]);
+
   const rows = groups
     .map((group) => ({
       group,
@@ -381,8 +410,11 @@ export function ProviderUpdateEnvironmentRows({
     return null;
   }
 
+  // The stacked toast body reserves `pr-5` under the close button. Extend the
+  // rows across it so their buttons share a right edge with the footer actions,
+  // and close the list with a divider above that footer.
   return (
-    <div className="mt-0.5 flex flex-col gap-1">
+    <div className="-mr-5 mt-0.5 flex flex-col gap-1 border-b border-border pb-2">
       {rows.map(({ group, status }) => (
         <EnvironmentUpdateRow
           key={group.environmentId}
