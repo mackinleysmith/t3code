@@ -851,6 +851,31 @@ describe("provider update launch notification logic", () => {
       ]);
     });
 
+    it("keeps a manual-only update on offer without a one-click trigger", () => {
+      const { groups } = buildEnvironmentUpdateGroups([
+        environment({
+          environmentId: "env-windows",
+          isPrimary: true,
+          providers: [provider({ driver: driver("claudeAgent"), canUpdate: false })],
+        }),
+      ]);
+      const group = groups[0]!;
+
+      expect(group.candidates).toEqual([]);
+      expect(group.manualCandidates.map((candidate) => candidate.driver)).toEqual(["claudeAgent"]);
+      expect(environmentGroupsWithUpdates(groups)).toHaveLength(1);
+      expect(environmentUpdateNotificationKeys(groups)).toEqual(["env-windows=claudeAgent:1.1.0"]);
+      expect(
+        resolveEnvironmentUpdateRowStatus({
+          group,
+          error: undefined,
+          result: undefined,
+          pill: null,
+          isPending: false,
+        }),
+      ).toEqual({ kind: "manual", text: "Claude from Settings" });
+    });
+
     it("keys each update by environment, driver and latest version", () => {
       const noUpdates = buildEnvironmentUpdateGroups([
         environment({
@@ -942,6 +967,7 @@ describe("provider update launch notification logic", () => {
       environmentId: "env-wsl" as EnvironmentId,
       label: "WSL",
       isPrimary: false,
+      manualCandidates: [],
       isSettling: false,
       candidates: [updateCandidate({ driver: driver("codex"), latestVersion: "1.1.0" })],
       providers: [],

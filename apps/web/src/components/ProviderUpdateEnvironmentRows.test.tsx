@@ -190,6 +190,7 @@ describe("ProviderUpdateEnvironmentRows", () => {
         isPrimary: false,
         isSettling: false,
         candidates: [candidate],
+        manualCandidates: [],
         providers: [candidate],
       },
     ];

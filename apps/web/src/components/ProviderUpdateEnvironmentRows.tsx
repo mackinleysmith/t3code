@@ -139,6 +139,10 @@ function EnvironmentUpdateRow({
         </Button>
       );
       break;
+    case "manual":
+      // The footer's Settings action is the way in; no per-row trigger.
+      trailing = null;
+      break;
     default:
       trailing = (
         <Button size="xs" variant="outline" onClick={onUpdate}>
@@ -404,7 +408,10 @@ export function ProviderUpdateEnvironmentRows({
         isPending: pendingEnvironments.has(group.environmentId),
       }),
     }))
-    .filter(({ group, status }) => group.candidates.length > 0 || status.kind !== "idle");
+    .filter(
+      ({ group, status }) =>
+        group.candidates.length > 0 || group.manualCandidates.length > 0 || status.kind !== "idle",
+    );
 
   if (rows.length === 0) {
     return null;

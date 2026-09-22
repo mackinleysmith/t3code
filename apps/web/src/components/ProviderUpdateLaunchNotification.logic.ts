@@ -663,6 +663,8 @@ export interface EnvironmentUpdateGroup {
   readonly isSettling: boolean;
   /** Outdated, one-click-updatable providers in this environment. */
   readonly candidates: ProviderUpdateCandidate[];
+  /** Outdated providers whose installer is unproven, so they update from Settings. */
+  readonly manualCandidates: ProviderUpdateCandidate[];
   /** Full provider list for this environment, used to derive live update progress. */
   readonly providers: ReadonlyArray<ServerProvider>;
 }
@@ -675,27 +677,33 @@ export interface EnvironmentUpdateGroup {
 export function buildEnvironmentUpdateGroups(
   environments: ReadonlyArray<EnvironmentProvidersInput>,
 ): { groups: EnvironmentUpdateGroup[]; isAnySettling: boolean } {
-  const groups = environments.map((environment) => ({
-    environmentId: environment.environmentId,
-    label: environment.label,
-    isPrimary: environment.isPrimary,
-    isSettling: environment.connectionState === "connecting",
-    candidates: collectProviderUpdateCandidates(environment.providers).filter((candidate) =>
-      canOneClickUpdateProviderCandidate(candidate, environment.providers),
-    ),
-    providers: environment.providers,
-  }));
+  const groups = environments.map((environment) => {
+    const updateCandidates = collectProviderUpdateCandidates(environment.providers);
+    return {
+      environmentId: environment.environmentId,
+      label: environment.label,
+      isPrimary: environment.isPrimary,
+      isSettling: environment.connectionState === "connecting",
+      candidates: updateCandidates.filter((candidate) =>
+        canOneClickUpdateProviderCandidate(candidate, environment.providers),
+      ),
+      manualCandidates: updateCandidates.filter(
+        (candidate) => !hasOneClickUpdateProviderCandidate(candidate, environment.providers),
+      ),
+      providers: environment.providers,
+    };
+  });
   const isAnySettling = environments.some(
     (environment) => environment.connectionState === "connecting",
   );
   return { groups, isAnySettling };
 }
 
-/** Groups that actually have a one-click update available, in display order (primary first). */
+/** Groups with an update on offer, one-click or manual, in display order (primary first). */
 export function environmentGroupsWithUpdates(
   groups: ReadonlyArray<EnvironmentUpdateGroup>,
 ): EnvironmentUpdateGroup[] {
-  return groups.filter((group) => group.candidates.length > 0);
+  return groups.filter((group) => group.candidates.length > 0 || group.manualCandidates.length > 0);
 }
 
 /**
@@ -709,7 +717,7 @@ export function environmentUpdateNotificationKeys(
 ): string[] {
   return groups
     .flatMap((group) =>
-      group.candidates.map(
+      [...group.candidates, ...group.manualCandidates].map(
         (candidate) =>
           `${group.environmentId}=${candidate.driver}:${candidate.versionAdvisory.latestVersion}`,
       ),
@@ -717,17 +725,33 @@ export function environmentUpdateNotificationKeys(
     .toSorted();
 }
 
-export type ProviderUpdateRowStatusKind = "idle" | "loading" | "success" | "failed" | "unchanged";
+export type ProviderUpdateRowStatusKind =
+  | "idle"
+  | "manual"
+  | "loading"
+  | "success"
+  | "failed"
+  | "unchanged";
 
 export interface ProviderUpdateRowStatus {
   readonly kind: ProviderUpdateRowStatusKind;
   readonly text: string;
 }
 
-function environmentProviderNames(group: EnvironmentUpdateGroup): string {
-  return group.candidates
+function providerNames(candidates: ReadonlyArray<ProviderUpdateCandidate>): string {
+  return candidates
     .map((candidate) => PROVIDER_DISPLAY_NAMES[candidate.driver] ?? candidate.driver)
     .join(", ");
+}
+
+/** "Codex" / "Claude from Settings" / "Codex · Claude from Settings". */
+function environmentProviderNames(group: EnvironmentUpdateGroup): string {
+  const oneClick = providerNames(group.candidates);
+  if (group.manualCandidates.length === 0) {
+    return oneClick;
+  }
+  const manual = `${providerNames(group.manualCandidates)} from Settings`;
+  return oneClick ? `${oneClick} · ${manual}` : manual;
 }
 
 /**
@@ -780,5 +804,9 @@ export function resolveEnvironmentUpdateRowStatus(input: {
   if (input.result || input.isPending) {
     return { kind: "loading", text: "Updating…" };
   }
-  return { kind: "idle", text: environmentProviderNames(input.group) };
+  // With nothing to run from here, the row only points at Settings.
+  return {
+    kind: input.group.candidates.length > 0 ? "idle" : "manual",
+    text: environmentProviderNames(input.group),
+  };
 }

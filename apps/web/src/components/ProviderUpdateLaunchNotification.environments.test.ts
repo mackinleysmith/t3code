@@ -22,6 +22,7 @@ describe("provider update environments", () => {
         }),
         connectionPhase: "connecting",
         hasServerConfig: false,
+        operateAccess: "pending",
       }),
     ).toBe(true);
 
@@ -34,6 +35,7 @@ describe("provider update environments", () => {
         }),
         connectionPhase: "connecting",
         hasServerConfig: false,
+        operateAccess: "pending",
       }),
     ).toBe(true);
   });
@@ -44,8 +46,23 @@ describe("provider update environments", () => {
         target: new RelayConnectionTarget({ environmentId, label: "Permafrost" }),
         connectionPhase: "connected",
         hasServerConfig: true,
+        operateAccess: "granted",
       }),
     ).toBe(true);
+  });
+
+  it("excludes a remote this client may only read, so no Update button can be rejected", () => {
+    const target = new RelayConnectionTarget({ environmentId, label: "Permafrost" });
+    for (const operateAccess of ["denied", "pending"] as const) {
+      expect(
+        shouldIncludeProviderUpdateEnvironment({
+          target,
+          connectionPhase: "connected",
+          hasServerConfig: true,
+          operateAccess,
+        }),
+      ).toBe(false);
+    }
   });
 
   it("excludes remote environments until they are connected and loaded", () => {
@@ -56,6 +73,7 @@ describe("provider update environments", () => {
         target,
         connectionPhase: "reconnecting",
         hasServerConfig: true,
+        operateAccess: "granted",
       }),
     ).toBe(false);
     expect(
@@ -63,6 +81,7 @@ describe("provider update environments", () => {
         target,
         connectionPhase: "connected",
         hasServerConfig: false,
+        operateAccess: "granted",
       }),
     ).toBe(false);
   });

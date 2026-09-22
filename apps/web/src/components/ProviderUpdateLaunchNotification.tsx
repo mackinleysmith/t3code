@@ -13,7 +13,12 @@ import {
 } from "./ProviderUpdateLaunchNotification.logic";
 import { ProviderUpdatePrimaryNotification } from "./ProviderUpdatePrimaryNotification";
 import { ProviderUpdateToastIcon } from "./ProviderUpdateToastIcon";
-import { stackedThreadToast, toastManager, type ThreadToastData } from "./ui/toast";
+import {
+  hiddenToastActionProps,
+  stackedThreadToast,
+  toastManager,
+  type ThreadToastData,
+} from "./ui/toast";
 
 /**
  * True when the catalog holds any environment besides the primary. This reads
@@ -67,11 +72,16 @@ function ProviderUpdateEnvironmentsNotification() {
     /** Every update this prompt has offered, so an unanswered close can un-see them. */
     readonly shownKeys: Set<string>;
     title: string;
+    hasOneClick: boolean;
     /** The toast's `data`, kept so a title refresh can re-send it with a new icon. */
     data: ThreadToastData;
   } | null>(null);
   // Filled by the rows body; the toast's "Update all" action calls through it.
   const updateAllRef = useRef<(() => void) | null>(null);
+  const updateAllActionProps = useMemo(
+    () => ({ children: "Update all", onClick: () => updateAllRef.current?.() }),
+    [],
+  );
   const notificationKeysRef = useRef<ReadonlyArray<string>>([]);
   // Whether the user has triggered an update from the current toast. Afterward
   // the prompt is kept even when no updates remain, so its result rows survive.
@@ -105,9 +115,9 @@ function ProviderUpdateEnvironmentsNotification() {
 
   // Title and icon summarize the distinct providers on offer across all
   // environments; the per-environment detail lives in the popover body.
-  const { title, soleDriver } = useMemo(() => {
+  const { title, soleDriver, hasOneClick } = useMemo(() => {
     const candidateUnion = collectProviderUpdateCandidates(
-      updateGroups.flatMap((group) => group.candidates),
+      updateGroups.flatMap((group) => [...group.candidates, ...group.manualCandidates]),
     );
     return {
       title: getProviderUpdateInitialToastView({
@@ -115,6 +125,8 @@ function ProviderUpdateEnvironmentsNotification() {
         oneClickProviders: candidateUnion,
       }).title,
       soleDriver: candidateUnion.length === 1 ? candidateUnion[0]!.driver : null,
+      // "Update all" only makes sense while something can run from here.
+      hasOneClick: updateGroups.some((group) => group.candidates.length > 0),
     };
   }, [updateGroups]);
 
@@ -156,13 +168,18 @@ function ProviderUpdateEnvironmentsNotification() {
         active.shownKeys.add(key);
         seenProviderUpdateNotificationKeys.add(key);
       }
-      if (active.title !== title) {
+      if (active.title !== title || active.hasOneClick !== hasOneClick) {
         active.title = title;
+        active.hasOneClick = hasOneClick;
         active.data = {
           ...active.data,
           leadingIcon: <ProviderUpdateToastIcon provider={soleDriver} />,
         };
-        toastManager.update(active.toastId, { title, data: active.data });
+        toastManager.update(active.toastId, {
+          title,
+          data: active.data,
+          actionProps: hasOneClick ? updateAllActionProps : hiddenToastActionProps,
+        });
       }
       return;
     }
@@ -206,18 +223,23 @@ function ProviderUpdateEnvironmentsNotification() {
           />
         ),
         timeout: 0,
-        actionProps: {
-          children: "Update all",
-          onClick: () => updateAllRef.current?.(),
-        },
+        actionProps: hasOneClick ? updateAllActionProps : hiddenToastActionProps,
         data,
       }),
     );
-    activeToastRef.current = { toastId, shownKeys: new Set(notificationKeys), title, data };
+    activeToastRef.current = {
+      toastId,
+      shownKeys: new Set(notificationKeys),
+      title,
+      hasOneClick,
+      data,
+    };
   }, [
     notificationKeys,
     title,
     soleDriver,
+    hasOneClick,
+    updateAllActionProps,
     isGated,
     closeUnansweredPrompt,
     dismissedNotificationKeys,
