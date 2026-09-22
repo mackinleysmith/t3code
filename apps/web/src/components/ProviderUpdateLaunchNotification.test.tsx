@@ -156,6 +156,20 @@ describe("ProviderUpdateLaunchNotification", () => {
     expect(testState.addToast).toHaveBeenCalledTimes(2);
   });
 
+  it("prompts again for a remote that dropped before the user dismissed the prompt", async () => {
+    const primary = { id: "primary", driver: "codex" };
+    const remote = { id: "permafrost", driver: "claudeAgent" };
+
+    await render(connected(primary, remote));
+    await render(connected(primary));
+    // The user closes the prompt while only the primary's update is on offer.
+    testState.addToast.mock.calls[0]![0].data.onClose();
+
+    await render(connected(primary, remote));
+
+    expect(testState.addToast).toHaveBeenCalledTimes(2);
+  });
+
   it("does not re-prompt for a declined update when other remotes come and go", async () => {
     testState.dismissedKeys = new Set(["tundra=codex:1.1.0"]);
 

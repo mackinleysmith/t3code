@@ -197,9 +197,21 @@ function ProviderUpdateEnvironmentsNotification() {
     hasInteractedRef.current = false;
 
     const dismissPrompt = () => {
+      const liveKeys = notificationKeysRef.current;
+      // An update whose environment dropped while the prompt was open is not
+      // being declined here, so forget it was shown; otherwise a rejoin would
+      // never prompt again this session.
+      const active = activeToastRef.current;
+      if (active !== null) {
+        for (const key of active.shownKeys) {
+          if (!liveKeys.includes(key)) {
+            seenProviderUpdateNotificationKeys.delete(key);
+          }
+        }
+      }
       // Dismiss whatever is still on offer at close time, so the popover does
       // not re-pop for updates the user just declined.
-      dismissNotificationKey(...notificationKeysRef.current);
+      dismissNotificationKey(...liveKeys);
       activeToastRef.current = null;
     };
 
