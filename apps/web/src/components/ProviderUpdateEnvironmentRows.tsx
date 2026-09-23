@@ -23,6 +23,7 @@ import {
   collectProviderUpdateOutcomeSnapshots,
   type EnvironmentUpdateGroup,
   firstRejectedProviderUpdateMessage,
+  getProviderUpdateInitialToastView,
   getProviderUpdateProgressToastView,
   getProviderUpdateSidebarPillView,
   isTerminalProviderUpdatePhase,
@@ -118,11 +119,28 @@ function EnvironmentUpdateRow({
   group,
   status,
   onUpdate,
+  solo,
 }: {
   readonly group: EnvironmentUpdateGroup;
   readonly status: ProviderUpdateRowStatus;
   readonly onUpdate: () => void;
+  /** The only environment listed: read like the single-prompt body, with the footer action as the trigger. */
+  readonly solo: boolean;
 }) {
+  if (solo) {
+    const atRest = status.kind === "idle" || status.kind === "manual";
+    return (
+      <span className={cn("text-muted-foreground", !atRest && rowToneClass(status.kind))}>
+        {atRest
+          ? getProviderUpdateInitialToastView({
+              updateProviders: [...group.candidates, ...group.manualCandidates],
+              oneClickProviders: group.candidates,
+            }).description
+          : status.text}
+      </span>
+    );
+  }
+
   let trailing: ReactNode;
   switch (status.kind) {
     case "loading":
@@ -155,7 +173,13 @@ function EnvironmentUpdateRow({
   return (
     <div className="flex items-center justify-between gap-3 py-0.5">
       <div className="flex min-w-0 flex-col">
-        <span className="truncate font-medium text-foreground">{group.label}</span>
+        <span className="flex min-w-0 items-baseline gap-1.5">
+          <span className="truncate font-medium text-foreground">{group.label}</span>
+          {group.isPrimary ? (
+            // The primary's label is its OS, which another listed machine can share.
+            <span className="shrink-0 text-xs text-muted-foreground">This machine</span>
+          ) : null}
+        </span>
         <span className={cn("truncate text-xs", rowToneClass(status.kind))}>{status.text}</span>
       </div>
       <div className="shrink-0">{trailing}</div>
@@ -417,17 +441,20 @@ export function ProviderUpdateEnvironmentRows({
     return null;
   }
 
-  // The stacked toast body reserves `pr-5` under the close button. Extend the
-  // rows across it so their buttons share a right edge with the footer actions,
-  // and close the list with a divider above that footer.
+  // With one environment listed there is nothing to tell apart, so the body
+  // reads like the single prompt. With several, the stacked toast body's
+  // `pr-5` under the close button is extended across so the row buttons share
+  // a right edge with the footer actions, and a divider closes the list.
+  const solo = rows.length === 1;
   return (
-    <div className="-mr-5 mt-0.5 flex flex-col gap-1 border-b border-border pb-2">
+    <div className={cn("mt-0.5 flex flex-col gap-1", !solo && "-mr-5 border-b border-border pb-2")}>
       {rows.map(({ group, status }) => (
         <EnvironmentUpdateRow
           key={group.environmentId}
           group={group}
           status={status}
           onUpdate={() => handleUpdate(group.environmentId)}
+          solo={solo}
         />
       ))}
     </div>
