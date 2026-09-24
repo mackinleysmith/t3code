@@ -392,6 +392,7 @@ function ComposerCitationNodeView({ node, editor, getPos }: NodeViewProps) {
       onKeyDown={(event: ReactKeyboardEvent<HTMLElement>) => {
         // Tab from the comment button returns to the caret after the chip.
         if (
+          !editor.isEditable ||
           event.key !== "Tab" ||
           event.shiftKey ||
           event.altKey ||

@@ -23,7 +23,7 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { AssistantCitationCommentEditor } from "./AssistantCitationCommentEditor";
 import { resolveAssistantCitationCommentDismissal } from "./assistantCitationCommentDismissal";
 import { observeAssistantCitationCommentSource } from "./AssistantCitationSource";
-import { composerFloatingLayerProps, isInsideComposerFloatingLayer } from "./composerEventScope";
+import { composerFloatingLayerProps } from "./composerEventScope";
 
 export function AssistantCitationChip({
   citation,
@@ -45,6 +45,7 @@ export function AssistantCitationChip({
 }) {
   const navigate = useNavigate();
   const commentInputRef = useRef<HTMLTextAreaElement>(null);
+  const commentPopupRef = useRef<HTMLDivElement>(null);
   const draftCommentRef = useRef<string | null>(null);
   const [unavailableSourceAnchor, setUnavailableSourceAnchor] =
     useState<AssistantCitationSourceAnchor | null>(null);
@@ -179,7 +180,7 @@ export function AssistantCitationChip({
                       const activeElement = document.activeElement;
                       if (
                         activeElement === document.body ||
-                        isInsideComposerFloatingLayer(activeElement)
+                        (activeElement !== null && commentPopupRef.current?.contains(activeElement))
                       ) {
                         commentEditor.onRestoreFocus?.();
                       }
@@ -187,6 +188,7 @@ export function AssistantCitationChip({
                     }
                   : undefined
               }
+              ref={commentPopupRef}
               aria-label="Edit citation comment"
               width="md"
               padding="compact"
