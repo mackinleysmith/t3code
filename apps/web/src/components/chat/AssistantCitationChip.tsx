@@ -23,7 +23,7 @@ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { AssistantCitationCommentEditor } from "./AssistantCitationCommentEditor";
 import { resolveAssistantCitationCommentDismissal } from "./assistantCitationCommentDismissal";
 import { observeAssistantCitationCommentSource } from "./AssistantCitationSource";
-import { composerFloatingLayerProps } from "./composerEventScope";
+import { composerFloatingLayerProps, isInsideComposerFloatingLayer } from "./composerEventScope";
 
 export function AssistantCitationChip({
   citation,
@@ -39,6 +39,8 @@ export function AssistantCitationChip({
     onCancel?: () => void;
     onSave: (comment: string) => boolean;
     onSaveAndSend?: (comment: string) => boolean;
+    /** Returns focus to the host editor when the popover closes instead of to the pencil trigger. */
+    onRestoreFocus?: () => void;
   };
 }) {
   const navigate = useNavigate();
@@ -155,6 +157,7 @@ export function AssistantCitationChip({
         >
           <PopoverTrigger
             aria-label={citation.comment ? "Edit citation comment" : "Add comment to citation"}
+            data-citation-comment-trigger="true"
             render={<ContextChipAction />}
           >
             <PencilIcon aria-hidden="true" />
@@ -169,6 +172,21 @@ export function AssistantCitationChip({
                 commentInputRef.current?.focus({ preventScroll: true });
                 return false;
               }}
+              finalFocus={
+                commentEditor.onRestoreFocus
+                  ? () => {
+                      // Leave focus alone when the user closed the popover by moving to another control.
+                      const activeElement = document.activeElement;
+                      if (
+                        activeElement === document.body ||
+                        isInsideComposerFloatingLayer(activeElement)
+                      ) {
+                        commentEditor.onRestoreFocus?.();
+                      }
+                      return false;
+                    }
+                  : undefined
+              }
               aria-label="Edit citation comment"
               width="md"
               padding="compact"
