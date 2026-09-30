@@ -391,11 +391,16 @@ function delimitedRows(rows: ReadonlyArray<ReadonlyArray<string>>, format: "tsv"
     .join("\n");
 }
 
-/** Cell text with `<br>` kept as a word boundary, which `textContent` drops. */
+/**
+ * Cell text with `<br>` kept as a word boundary and images as their alt text,
+ * both of which `textContent` drops.
+ */
 function tableCellText(node: Node): string {
   if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
   if (node.nodeType !== Node.ELEMENT_NODE) return "";
-  if ((node as Element).tagName === "BR") return " ";
+  const element = node as Element;
+  if (element.tagName === "BR") return " ";
+  if (element.tagName === "IMG") return element.getAttribute("alt") ?? "";
   return [...node.childNodes].map(tableCellText).join("");
 }
 
@@ -418,6 +423,7 @@ const markdownTableParser = unified().use(remarkParse).use(remarkGfm);
 
 function markdownPlainText(node: Nodes): string {
   if (node.type === "html" || node.type === "break") return " ";
+  if (node.type === "image" || node.type === "imageReference") return node.alt ?? "";
   if ("value" in node) return node.value;
   if ("children" in node) return node.children.map(markdownPlainText).join("");
   return "";

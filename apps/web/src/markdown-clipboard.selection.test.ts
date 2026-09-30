@@ -37,7 +37,7 @@ describe("chatMarkdownClipboardPayload", () => {
     );
   });
 
-  it("keeps empty edge cells and line breaks inside cells", () => {
+  it("keeps empty edge cells, line breaks, and image alt text inside cells", () => {
     document.body.innerHTML = `
       <p>Status</p>
       <table>
@@ -45,12 +45,13 @@ describe("chatMarkdownClipboardPayload", () => {
         <tbody>
           <tr><td></td><td>Platform</td></tr>
           <tr><td>first<br>second</td><td></td></tr>
+          <tr><td><img alt="Build badge" src="b.svg"></td><td>ok</td></tr>
         </tbody>
       </table>`;
     const selection = selectBetween(document.body, document.body);
 
     expect(chatMarkdownClipboardPayload(selection, "tsv")?.text).toBe(
-      "Status\n\nQuestion\tOwner\n\tPlatform\nfirst second\t",
+      "Status\n\nQuestion\tOwner\n\tPlatform\nfirst second\t\nBuild badge\tok",
     );
   });
 
