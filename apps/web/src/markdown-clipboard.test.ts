@@ -379,6 +379,12 @@ describe("markdownWithTableCopyFormat", () => {
     );
   });
 
+  it("fits each row to the header's width, as the rendered table does", () => {
+    const ragged = ["| a | b |", "| - | - |", "| 1 | 2 | 3 |", "| x |"].join("\n");
+
+    expect(markdownWithTableCopyFormat(ragged, "tsv")).toBe("a\tb\n1\t2\nx\t");
+  });
+
   it("quotes CSV cells that contain commas", () => {
     expect(markdownWithTableCopyFormat(message, "csv")).toContain('"Owner, team",Platform');
   });

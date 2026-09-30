@@ -37,6 +37,23 @@ describe("chatMarkdownClipboardPayload", () => {
     );
   });
 
+  it("keeps empty edge cells and line breaks inside cells", () => {
+    document.body.innerHTML = `
+      <p>Status</p>
+      <table>
+        <thead><tr><th>Question</th><th>Owner</th></tr></thead>
+        <tbody>
+          <tr><td></td><td>Platform</td></tr>
+          <tr><td>first<br>second</td><td></td></tr>
+        </tbody>
+      </table>`;
+    const selection = selectBetween(document.body, document.body);
+
+    expect(chatMarkdownClipboardPayload(selection, "tsv")?.text).toBe(
+      "Status\n\nQuestion\tOwner\n\tPlatform\nfirst second\t",
+    );
+  });
+
   it("keeps a selection inside one cell as plain text", () => {
     document.body.innerHTML = `<table><tbody><tr><td>Platform</td></tr></tbody></table>`;
     const cell = document.querySelector("td")!;

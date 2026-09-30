@@ -343,6 +343,9 @@ function tidyMarkdown(markdown: string): string {
     .trim();
 }
 
+const DELIMITED_TABLE_MARKER = "\uE000";
+const DELIMITED_TABLE_PLACEHOLDER = /\uE000(\d+)\uE000/g;
+
 /**
  * Serializes a rendered fragment back to markdown. Tables follow `tableFormat`;
  * delimited formats replace each table with its TSV or CSV rows.
@@ -354,15 +357,22 @@ export function serializeRenderedMarkdownFragment(
   const codeBlock = soleCodeBlock(container);
   if (codeBlock) return (codeBlock.textContent ?? "").replace(/\n$/, "");
   if (tableFormat === "markdown") return tidyMarkdown(serializeChildren(container));
-  // Tag a copy so the caller's fragment still produces untouched HTML.
+  // Tag a copy so the caller's fragment still produces untouched HTML. Tables
+  // stay placeholders through tidyMarkdown, which would strip the tabs of empty
+  // edge cells and shift the columns after them.
   const tagged = container.cloneNode(true) as Element;
+  const delimitedTables: string[] = [];
   for (const table of tagged.querySelectorAll("table")) {
     table.setAttribute(
       "data-markdown-copy",
-      `${serializeTableElementToDelimited(table, tableFormat)}\n\n`,
+      `${DELIMITED_TABLE_MARKER}${delimitedTables.length}${DELIMITED_TABLE_MARKER}\n\n`,
     );
+    delimitedTables.push(serializeTableElementToDelimited(table, tableFormat));
   }
-  return tidyMarkdown(serializeChildren(tagged));
+  return tidyMarkdown(serializeChildren(tagged)).replace(
+    DELIMITED_TABLE_PLACEHOLDER,
+    (_, index: string) => delimitedTables[Number(index)] ?? "",
+  );
 }
 
 export function serializeTableElementToMarkdown(table: Element): string {
@@ -383,6 +393,14 @@ function delimitedRows(rows: ReadonlyArray<ReadonlyArray<string>>, format: "tsv"
     .join("\n");
 }
 
+/** Cell text with `<br>` kept as a word boundary, which `textContent` drops. */
+function tableCellText(node: Node): string {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+  if (node.nodeType !== Node.ELEMENT_NODE) return "";
+  if ((node as Element).tagName === "BR") return " ";
+  return [...node.childNodes].map(tableCellText).join("");
+}
+
 /**
  * Tab-separated rows are what spreadsheets put on the clipboard, and what Slack
  * and spreadsheet apps turn back into a real table on paste.
@@ -392,7 +410,7 @@ export function serializeTableElementToDelimited(table: Element, format: "tsv" |
     .map((row) =>
       [...row.children]
         .filter((cell) => cell.tagName === "TH" || cell.tagName === "TD")
-        .map((cell) => cell.textContent ?? ""),
+        .map(tableCellText),
     )
     .filter((cells) => cells.length > 0);
   return delimitedRows(rows, format);
@@ -430,7 +448,15 @@ export function markdownWithTableCopyFormat(markdown: string, format: TableCopyF
     const start = table.position?.start.offset;
     const end = table.position?.end.offset;
     if (start === undefined || end === undefined) continue;
-    const rows = table.children.map((row) => row.children.map(markdownPlainText));
+    // GFM pads short rows and drops surplus cells to the header's width when
+    // rendering; the syntax tree keeps them as written.
+    const width = table.align?.length ?? table.children[0]?.children.length ?? 0;
+    const rows = table.children.map((row) =>
+      Array.from({ length: width }, (_, index) => {
+        const cell = row.children[index];
+        return cell ? markdownPlainText(cell) : "";
+      }),
+    );
     result = `${result.slice(0, start)}${delimitedRows(rows, format)}${result.slice(end)}`;
   }
   return result;
