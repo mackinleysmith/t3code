@@ -385,6 +385,12 @@ describe("markdownWithTableCopyFormat", () => {
     expect(markdownWithTableCopyFormat(ragged, "tsv")).toBe("a\tb\n1\t2\nx\t");
   });
 
+  it("drops the quote prefix from every row of a quoted table", () => {
+    const quoted = ["> Note", ">", "> | a | b |", "> | - | - |", "> | 1 | 2 |"].join("\n");
+
+    expect(markdownWithTableCopyFormat(quoted, "tsv")).toBe("> Note\n>\na\tb\n1\t2");
+  });
+
   it("quotes CSV cells that contain commas", () => {
     expect(markdownWithTableCopyFormat(message, "csv")).toContain('"Owner, team",Platform');
   });

@@ -343,9 +343,6 @@ function tidyMarkdown(markdown: string): string {
     .trim();
 }
 
-const DELIMITED_TABLE_MARKER = "\uE000";
-const DELIMITED_TABLE_PLACEHOLDER = /\uE000(\d+)\uE000/g;
-
 /**
  * Serializes a rendered fragment back to markdown. Tables follow `tableFormat`;
  * delimited formats replace each table with its TSV or CSV rows.
@@ -356,22 +353,23 @@ export function serializeRenderedMarkdownFragment(
 ): string {
   const codeBlock = soleCodeBlock(container);
   if (codeBlock) return (codeBlock.textContent ?? "").replace(/\n$/, "");
-  if (tableFormat === "markdown") return tidyMarkdown(serializeChildren(container));
+  if (tableFormat === "markdown" || container.nodeType !== Node.ELEMENT_NODE) {
+    return tidyMarkdown(serializeChildren(container));
+  }
   // Tag a copy so the caller's fragment still produces untouched HTML. Tables
   // stay placeholders through tidyMarkdown, which would strip the tabs of empty
-  // edge cells and shift the columns after them.
+  // edge cells and shift the columns after them. The per-copy marker cannot
+  // collide with copied text.
   const tagged = container.cloneNode(true) as Element;
+  const marker = `\uE000${Math.random().toString(36).slice(2)}\uE000`;
   const delimitedTables: string[] = [];
   for (const table of tagged.querySelectorAll("table")) {
-    table.setAttribute(
-      "data-markdown-copy",
-      `${DELIMITED_TABLE_MARKER}${delimitedTables.length}${DELIMITED_TABLE_MARKER}\n\n`,
-    );
+    table.setAttribute("data-markdown-copy", `${marker}${delimitedTables.length}${marker}\n\n`);
     delimitedTables.push(serializeTableElementToDelimited(table, tableFormat));
   }
   return tidyMarkdown(serializeChildren(tagged)).replace(
-    DELIMITED_TABLE_PLACEHOLDER,
-    (_, index: string) => delimitedTables[Number(index)] ?? "",
+    new RegExp(`${marker}(\\d+)${marker}`, "g"),
+    (match, index: string) => delimitedTables[Number(index)] ?? match,
   );
 }
 
@@ -457,7 +455,12 @@ export function markdownWithTableCopyFormat(markdown: string, format: TableCopyF
         return cell ? markdownPlainText(cell) : "";
       }),
     );
-    result = `${result.slice(0, start)}${delimitedRows(rows, format)}${result.slice(end)}`;
+    // A table in a blockquote or list starts after its line's container prefix
+    // ("> ", indentation) and swallows that prefix on later lines. Replace from
+    // the line start so no row keeps a stray marker.
+    const lineStart = result.lastIndexOf("\n", start - 1) + 1;
+    const replaceFrom = /^[\s>]*$/.test(result.slice(lineStart, start)) ? lineStart : start;
+    result = `${result.slice(0, replaceFrom)}${delimitedRows(rows, format)}${result.slice(end)}`;
   }
   return result;
 }
