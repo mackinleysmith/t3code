@@ -452,6 +452,26 @@ function sanitizedHtmlFrom(container: Element): string {
   return `<meta charset="utf-8">${container.innerHTML}`;
 }
 
+const TABLE_INTERIOR_TAGS = new Set(["TABLE", "THEAD", "TBODY", "TFOOT", "TR"]);
+
+/**
+ * A range spanning several cells or rows clones without its `table`, leaving
+ * nothing to serialize as a table. Rebuilds the shell from the table down to
+ * the range's common ancestor around the cloned fragment.
+ */
+function withTableShell(ancestor: Element | null, fragment: DocumentFragment): Node {
+  if (!ancestor || !TABLE_INTERIOR_TAGS.has(ancestor.tagName)) return fragment;
+  const table = ancestor.closest("table");
+  let shell: Node = fragment;
+  for (let element: Element | null = ancestor; element; element = element.parentElement) {
+    const clone = element.cloneNode(false);
+    clone.appendChild(shell);
+    shell = clone;
+    if (element === table) break;
+  }
+  return shell;
+}
+
 export function chatMarkdownClipboardPayload(
   selection: Selection,
   tableFormat: TableCopyFormat = "markdown",
@@ -461,11 +481,11 @@ export function chatMarkdownClipboardPayload(
   for (let index = 0; index < selection.rangeCount; index += 1) {
     const range = selection.getRangeAt(index);
     if (range.collapsed) continue;
-    const container = document.createElement("div");
-    container.appendChild(range.cloneContents());
     const ancestor = range.commonAncestorContainer;
     const ancestorElement =
       ancestor.nodeType === Node.ELEMENT_NODE ? (ancestor as Element) : ancestor.parentElement;
+    const container = document.createElement("div");
+    container.appendChild(withTableShell(ancestorElement, range.cloneContents()));
     if (ancestorElement?.closest("pre")) {
       const text = range.toString();
       if (text) {
