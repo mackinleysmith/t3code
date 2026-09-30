@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { serializeRenderedMarkdownFragment } from "./markdown-clipboard";
+import {
+  markdownWithTableCopyFormat,
+  serializeRenderedMarkdownFragment,
+} from "./markdown-clipboard";
 import { EnvironmentId, MessageId, ThreadId } from "@t3tools/contracts";
 import {
   collectAssistantCitations,
@@ -341,5 +344,42 @@ describe("serializeRenderedMarkdownFragment", () => {
     expect(serializeRenderedMarkdownFragment(asNode(container))).toBe(
       "Hello World (Document template)",
     );
+  });
+});
+
+describe("markdownWithTableCopyFormat", () => {
+  const message = [
+    "Here is the status.",
+    "",
+    "| Question | Answer |",
+    "| --- | --- |",
+    "| **Loader** URL? | See [docs](https://example.com) and `v2\\|v3` |",
+    "| Owner, team | Platform |",
+    "",
+    "```md",
+    "| a | b |",
+    "| - | - |",
+    "```",
+  ].join("\n");
+
+  it("rewrites tables as plain-text tab-separated rows and leaves everything else alone", () => {
+    expect(markdownWithTableCopyFormat(message, "tsv")).toBe(
+      [
+        "Here is the status.",
+        "",
+        "Question\tAnswer",
+        "Loader URL?\tSee docs and v2|v3",
+        "Owner, team\tPlatform",
+        "",
+        "```md",
+        "| a | b |",
+        "| - | - |",
+        "```",
+      ].join("\n"),
+    );
+  });
+
+  it("quotes CSV cells that contain commas", () => {
+    expect(markdownWithTableCopyFormat(message, "csv")).toContain('"Owner, team",Platform');
   });
 });

@@ -2,9 +2,16 @@
  * Converts a DOM selection inside rendered chat markdown back into markdown
  * source so highlight-and-copy keeps formatting (links, emphasis, lists,
  * fences, tables) instead of flattening to plain text. The `text/plain`
- * clipboard flavor carries the markdown; `text/html` carries a sanitized
- * copy of the rendered fragment for rich-paste targets.
+ * clipboard flavor carries the markdown, with tables in the user's table copy
+ * format; `text/html` carries a sanitized copy of the rendered fragment for
+ * rich-paste targets.
  */
+
+import type { TableCopyFormat } from "@t3tools/contracts";
+import type { Nodes, Table } from "mdast";
+import remarkGfm from "remark-gfm";
+import remarkParse from "remark-parse";
+import { unified } from "unified";
 
 const SKIPPED_TAGS = new Set(["BUTTON", "INPUT", "SCRIPT", "STYLE", "TEMPLATE"]);
 const SKIPPED_CLASS_NAMES = ["select-none", "sr-only"];
@@ -336,32 +343,97 @@ function tidyMarkdown(markdown: string): string {
     .trim();
 }
 
-export function serializeRenderedMarkdownFragment(container: Node): string {
+/**
+ * Serializes a rendered fragment back to markdown. Tables follow `tableFormat`;
+ * delimited formats replace each table with its TSV or CSV rows.
+ */
+export function serializeRenderedMarkdownFragment(
+  container: Node,
+  tableFormat: TableCopyFormat = "markdown",
+): string {
   const codeBlock = soleCodeBlock(container);
   if (codeBlock) return (codeBlock.textContent ?? "").replace(/\n$/, "");
-  return tidyMarkdown(serializeChildren(container));
+  if (tableFormat === "markdown") return tidyMarkdown(serializeChildren(container));
+  // Tag a copy so the caller's fragment still produces untouched HTML.
+  const tagged = container.cloneNode(true) as Element;
+  for (const table of tagged.querySelectorAll("table")) {
+    table.setAttribute(
+      "data-markdown-copy",
+      `${serializeTableElementToDelimited(table, tableFormat)}\n\n`,
+    );
+  }
+  return tidyMarkdown(serializeChildren(tagged));
 }
 
 export function serializeTableElementToMarkdown(table: Element): string {
   return serializeTable(table).trim();
 }
 
-function csvCell(value: string): string {
+/** Collapses a cell to one line so it cannot break the row or column grid. */
+function delimitedCell(value: string, format: "tsv" | "csv"): string {
   const normalized = value.replace(/\s+/g, " ").trim();
+  if (format === "tsv") return normalized;
   return /[",\n]/.test(normalized) ? `"${normalized.replaceAll('"', '""')}"` : normalized;
 }
 
-export function serializeTableElementToCsv(table: Element): string {
-  const rows = [...table.querySelectorAll(":scope > thead > tr, :scope > tbody > tr, :scope > tr")];
-  const lines: string[] = [];
-  for (const row of rows) {
-    const cells = [...row.children].filter(
-      (cell) => cell.tagName === "TH" || cell.tagName === "TD",
-    );
-    if (cells.length === 0) continue;
-    lines.push(cells.map((cell) => csvCell(cell.textContent ?? "")).join(","));
+function delimitedRows(rows: ReadonlyArray<ReadonlyArray<string>>, format: "tsv" | "csv"): string {
+  const separator = format === "tsv" ? "\t" : ",";
+  return rows
+    .map((cells) => cells.map((cell) => delimitedCell(cell, format)).join(separator))
+    .join("\n");
+}
+
+/**
+ * Tab-separated rows are what spreadsheets put on the clipboard, and what Slack
+ * and spreadsheet apps turn back into a real table on paste.
+ */
+export function serializeTableElementToDelimited(table: Element, format: "tsv" | "csv"): string {
+  const rows = [...table.querySelectorAll(":scope > thead > tr, :scope > tbody > tr, :scope > tr")]
+    .map((row) =>
+      [...row.children]
+        .filter((cell) => cell.tagName === "TH" || cell.tagName === "TD")
+        .map((cell) => cell.textContent ?? ""),
+    )
+    .filter((cells) => cells.length > 0);
+  return delimitedRows(rows, format);
+}
+
+const markdownTableParser = unified().use(remarkParse).use(remarkGfm);
+
+function markdownPlainText(node: Nodes): string {
+  if (node.type === "html" || node.type === "break") return " ";
+  if ("value" in node) return node.value;
+  if ("children" in node) return node.children.map(markdownPlainText).join("");
+  return "";
+}
+
+function collectMarkdownTables(node: Nodes, tables: Table[]): void {
+  if (node.type === "table") {
+    tables.push(node);
+    return;
   }
-  return lines.join("\n");
+  if ("children" in node) {
+    for (const child of node.children) collectMarkdownTables(child, tables);
+  }
+}
+
+/**
+ * Rewrites GFM tables in markdown source as TSV or CSV, leaving the rest of the
+ * message untouched. Used when copying a whole message; cells become plain text.
+ */
+export function markdownWithTableCopyFormat(markdown: string, format: TableCopyFormat): string {
+  if (format === "markdown" || !markdown.includes("|")) return markdown;
+  const tables: Table[] = [];
+  collectMarkdownTables(markdownTableParser.parse(markdown), tables);
+  let result = markdown;
+  for (const table of tables.toReversed()) {
+    const start = table.position?.start.offset;
+    const end = table.position?.end.offset;
+    if (start === undefined || end === undefined) continue;
+    const rows = table.children.map((row) => row.children.map(markdownPlainText));
+    result = `${result.slice(0, start)}${delimitedRows(rows, format)}${result.slice(end)}`;
+  }
+  return result;
 }
 
 function sanitizedHtmlFrom(container: Element): string {
@@ -382,6 +454,7 @@ function sanitizedHtmlFrom(container: Element): string {
 
 export function chatMarkdownClipboardPayload(
   selection: Selection,
+  tableFormat: TableCopyFormat = "markdown",
 ): MarkdownClipboardPayload | null {
   const texts: string[] = [];
   const htmls: string[] = [];
@@ -401,7 +474,7 @@ export function chatMarkdownClipboardPayload(
       }
       continue;
     }
-    const text = serializeRenderedMarkdownFragment(container);
+    const text = serializeRenderedMarkdownFragment(container, tableFormat);
     if (!text) continue;
     texts.push(text);
     htmls.push(sanitizedHtmlFrom(container));
