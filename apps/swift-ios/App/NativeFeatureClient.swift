@@ -6477,6 +6477,7 @@ final class NativeFeatureClient: FeatureClient, FeatureDeviceManaging,
                     source: $0.source.flatMap { try? $0.decode(PastedTextAttachmentSource.self) }
                 )
             },
+            updatedAt: parseDate(message.updatedAt),
             context: message.context
         )
     }
