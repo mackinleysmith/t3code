@@ -359,7 +359,9 @@ function tableCellText(node: Node): string {
 
 function delimitedCell(value: string, format: "tsv" | "csv"): string {
   const text = value.replace(/\s+/g, " ").trim();
-  const isNumeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text);
+  const isNumeric = /^[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(
+    text,
+  );
   const normalized = /^[=+\-@]/.test(text) && !isNumeric ? `'${text}` : text;
   if (format === "tsv" && !normalized.startsWith('"')) return normalized;
   return /[",\n]/.test(normalized) ? `"${normalized.replaceAll('"', '""')}"` : normalized;

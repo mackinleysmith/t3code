@@ -29,11 +29,21 @@ describe("serializeTableElementToDelimited", () => {
 
   it.each(["tsv", "csv"] as const)("copies formula-leading text literally in %s", (format) => {
     const table = renderTable(
-      "<table><tr><td>=1+1</td><td>+SUM(A1)</td><td>-cmd</td><td>&#64;cmd</td><td>-42</td><td>+1.5e2</td></tr></table>",
+      "<table><tr><td>=1+1</td><td>+SUM(A1)</td><td>-cmd</td><td>&#64;cmd</td><td>-42</td><td>+1.5e2</td><td>-1,000</td><td>+1,234.5e2</td><td>-1,000+1</td><td>-1,00</td></tr></table>",
     );
     const separator = format === "tsv" ? "\t" : ",";
     expect(serializeTableElementToDelimited(table, format)).toBe(
-      ["'=1+1", "'+SUM(A1)", "'-cmd", "'@cmd", "-42", "+1.5e2"].join(separator),
+      [
+        "'=1+1",
+        "'+SUM(A1)",
+        "'-cmd",
+        "'@cmd",
+        "-42",
+        "+1.5e2",
+        ...(format === "tsv"
+          ? ["-1,000", "+1,234.5e2", "'-1,000+1", "'-1,00"]
+          : ['"-1,000"', '"+1,234.5e2"', '"\'-1,000+1"', '"\'-1,00"']),
+      ].join(separator),
     );
   });
 
