@@ -171,6 +171,7 @@ export interface ProviderSessionManagerV2Shape {
     readonly providerSessionId: ProviderSessionId;
     readonly modelSelection: ModelSelection;
     readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
+    readonly preserveRuntimeMode?: boolean;
     readonly resumeFromSession?: OrchestrationV2ProviderSession;
     readonly initialNativeThreadId?: string;
     readonly initialProviderItemIdentityVersion?: 2;
@@ -2157,6 +2158,7 @@ export const layerWithOptions = (
               let existing = (yield* Ref.get(sessions)).get(key);
               if (
                 existing !== undefined &&
+                input.preserveRuntimeMode !== true &&
                 existing.runtimeMode !== input.runtimePolicy.runtimeMode &&
                 !existing.runtime.providerSession.capabilities.sessions
                   .supportsRuntimeModeSwitchInSession

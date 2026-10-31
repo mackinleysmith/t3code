@@ -450,7 +450,11 @@ it.live("retries a failed selection restart session open before completing", () 
  */
 const switchModeMidTurn = (
   name: string,
-  options: { readonly backgroundWork: boolean; readonly shared?: boolean },
+  options: {
+    readonly backgroundWork: boolean;
+    readonly shared?: boolean;
+    readonly continuation?: boolean;
+  },
 ) =>
   Effect.gen(function* () {
     const cwd = yield* checkpointWorkspace(name);
@@ -498,8 +502,8 @@ const switchModeMidTurn = (
           );
           yield* orchestrator.dispatch({
             type: "message.dispatch",
-            createdBy: "user",
-            creationSource: "web",
+            createdBy: options.continuation && step === "second" ? "agent" : "user",
+            creationSource: options.continuation && step === "second" ? "provider" : "web",
             commandId: CommandId.make(`${name}:${step}`),
             threadId,
             messageId: MessageId.make(`${name}:${step}`),
@@ -564,30 +568,32 @@ const switchModeMidTurn = (
     return result;
   });
 
-it.live("a runtime mode change waits for the next turn instead of ending the current one", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const { midTurn, closedMidTurn, captured } = yield* switchModeMidTurn(
-        "runtime-mode-mid-turn",
-        { backgroundWork: false },
-      );
-      assert.equal(midTurn.thread.runtimeMode, "auto");
-      assert.equal(closedMidTurn, 0);
-      assert.deepEqual(
-        midTurn.runs.map((run) => run.status),
-        ["running"],
-      );
-      assert.equal(captured.closedSessionCount, 1);
-      assert.deepEqual(
-        captured.opened.map((open) => open.runtimeMode),
-        ["approval-required", "auto"],
-      );
-      assert.deepEqual(
-        captured.started.map((turn) => turn.runtimeMode),
-        ["approval-required", "auto"],
-      );
-    }),
-  ),
+it.live.each([false, true])(
+  "a runtime mode change preserves active turns and continuations (continuation: %s)",
+  (continuation) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { midTurn, closedMidTurn, captured } = yield* switchModeMidTurn(
+          "runtime-mode-mid-turn",
+          { backgroundWork: continuation, continuation },
+        );
+        assert.equal(midTurn.thread.runtimeMode, "auto");
+        assert.equal(closedMidTurn, 0);
+        assert.deepEqual(
+          midTurn.runs.map((run) => run.status),
+          ["running"],
+        );
+        assert.equal(captured.closedSessionCount, continuation ? 0 : 1);
+        assert.deepEqual(
+          captured.opened.map((open) => open.runtimeMode),
+          continuation ? ["approval-required"] : ["approval-required", "auto"],
+        );
+        assert.deepEqual(
+          captured.started.map((turn) => turn.runtimeMode),
+          ["approval-required", "auto"],
+        );
+      }),
+    ),
 );
 
 it.live.each([false, true])(
