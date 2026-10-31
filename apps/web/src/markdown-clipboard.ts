@@ -356,8 +356,10 @@ function tableCellText(node: Node): string {
 }
 
 function delimitedCell(value: string, format: "tsv" | "csv"): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (format === "tsv") return normalized;
+  const text = value.replace(/\s+/g, " ").trim();
+  const isNumeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(text);
+  const normalized = /^[=+\-@]/.test(text) && !isNumeric ? `'${text}` : text;
+  if (format === "tsv" && !normalized.startsWith('"')) return normalized;
   return /[",\n]/.test(normalized) ? `"${normalized.replaceAll('"', '""')}"` : normalized;
 }
 
@@ -369,13 +371,13 @@ export function serializeTableElementToDelimited(table: Element, format: "tsv" |
       (cell) => cell.tagName === "TH" || cell.tagName === "TD",
     );
     if (cells.length === 0) continue;
-    lines.push(cells.map((cell) => delimitedCell(tableCellText(cell), format)).join(format === "tsv" ? "\t" : ","));
+    lines.push(
+      cells
+        .map((cell) => delimitedCell(tableCellText(cell), format))
+        .join(format === "tsv" ? "\t" : ","),
+    );
   }
   return lines.join("\n");
-}
-
-export function serializeTableElementToCsv(table: Element): string {
-  return serializeTableElementToDelimited(table, "csv");
 }
 
 function mermaidSourceHtml(source: string) {
