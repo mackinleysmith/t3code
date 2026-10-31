@@ -351,6 +351,8 @@ function tableCellText(node: Node): string {
     return element.getAttribute("data-markdown-copy")?.trim() ?? "";
   }
   if (element.tagName === "BR") return " ";
+  const placeholderAlt = element.getAttribute("data-markdown-alt");
+  if (placeholderAlt !== null) return placeholderAlt;
   if (element.tagName === "IMG") return element.getAttribute("alt") ?? "";
   return [...node.childNodes].map(tableCellText).join("");
 }
